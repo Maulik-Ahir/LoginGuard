@@ -2,6 +2,9 @@
   <Folder Name="/Service/">
     <Project Path="Service/LoginGuardService.csproj" />
   </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/ConfigManagerTests/ConfigManagerTests.csproj" />
+  </Folder>
   <Folder Name="/UI/">
     <Project Path="UI/LoginGuardUI.csproj" />
   </Folder>

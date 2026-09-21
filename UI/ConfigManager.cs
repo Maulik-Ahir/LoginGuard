@@ -9,7 +9,7 @@ public static class ConfigManager
 
     public static string GetConfigFilePath()
     {
-        // 1. Check relative to UI directory in standard install: ../Service/appsettings.Secrets.json
+        // 1. Check relative to UI directory in standard production install: ../Service/appsettings.Secrets.json
         string appDir = AppContext.BaseDirectory;
         string installedPath = Path.GetFullPath(Path.Combine(appDir, "..", "Service", "appsettings.Secrets.json"));
         if (File.Exists(installedPath))
@@ -17,18 +17,18 @@ public static class ConfigManager
             return installedPath;
         }
 
-        // 2. Check development environment relative paths
-        string devRelativePath = Path.GetFullPath(Path.Combine(appDir, "..", "..", "..", "..", "Service", "appsettings.Secrets.json"));
-        if (File.Exists(devRelativePath))
+        // 2. Check development environment relative paths (from bin/Debug/...)
+        string devServiceDir = Path.GetFullPath(Path.Combine(appDir, "..", "..", "..", "..", "Service"));
+        if (Directory.Exists(devServiceDir))
         {
-            return devRelativePath;
+            return Path.Combine(devServiceDir, "appsettings.Secrets.json");
         }
 
-        // 3. Check fixed workspace path if developing in c:\antigrav
-        string workspacePath = @"C:\antigrav\Service\appsettings.Secrets.json";
-        if (File.Exists(workspacePath))
+        // 3. Check workspace development path
+        string workspaceServiceDir = @"C:\antigrav\Service";
+        if (Directory.Exists(workspaceServiceDir))
         {
-            return workspacePath;
+            return Path.Combine(workspaceServiceDir, "appsettings.Secrets.json");
         }
 
         // 4. Check standard Program Files production location
@@ -38,8 +38,8 @@ public static class ConfigManager
             return defaultProdPath;
         }
 
-        // Default to the installed relative path (will be created if saved)
-        return Directory.Exists(Path.GetDirectoryName(installedPath)) ? installedPath : workspacePath;
+        // Default to installed relative path
+        return installedPath;
     }
 
     public static AppConfig Load()
