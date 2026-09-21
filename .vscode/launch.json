@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch LoginGuard UI",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build:ui",
+      "program": "${workspaceFolder}/UI/bin/Debug/net10.0-windows/LoginGuardUI.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/UI",
+      "stopAtEntry": false,
+      "console": "internalConsole"
+    },
+    {
+      "name": "Launch LoginGuard Service (Console Mode)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build:service",
+      "program": "${workspaceFolder}/Service/bin/Debug/net10.0-windows/LoginGuardService.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/Service",
+      "stopAtEntry": false,
+      "console": "internalConsole"
+    }
+  ]
+}

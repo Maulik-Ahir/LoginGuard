@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "build",
+        "${workspaceFolder}/LoginGuard.slnx",
+        "/property:GenerateFullPaths=true",
+        "/consoleloggerparameters:NoSummary"
+      ],
+      "problemMatcher": "$msCompile",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "build:service",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "build",
+        "${workspaceFolder}/Service/LoginGuardService.csproj",
+        "/property:GenerateFullPaths=true"
+      ],
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build:ui",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "build",
+        "${workspaceFolder}/UI/LoginGuardUI.csproj",
+        "/property:GenerateFullPaths=true"
+      ],
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "clean",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "clean",
+        "${workspaceFolder}/LoginGuard.slnx"
+      ],
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+# Build and compiler artifacts (Bare patterns to cover root and all subdirectories)
+bin/
+obj/
+publish/
+
+# Visual Studio / Visual Studio Code
+.vs/
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+*.user
+*.suo
+*.userosv
+*.userprefs
+*.dbmdl
+
+# Secrets and Sensitive User Configuration (CRITICAL for privacy and security)
+appsettings.Secrets.json
+*.Secrets.json
+*.key
+*.pem
+
+# Runtime logs and evidence captures (Sensitive evidence data)
+service_log.txt
+*.old
+Captures/
+PendingNotifications/
+
+# Inno Setup output
+Output/
+installer_output/
+*.tmp
