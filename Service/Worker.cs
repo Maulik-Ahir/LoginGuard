@@ -221,7 +221,7 @@ public class Worker : BackgroundService
     {
         try
         {
-            string? token = _config["Telegram:BotToken"]?.Trim();
+            string? token = _config["Telegram:BotToken"];
             string? chatId = _config["Telegram:ChatId"]?.Trim();
 
             if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(chatId))
