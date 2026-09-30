@@ -10,6 +10,13 @@ namespace LoginGuardService;
 
 public class Worker : BackgroundService
 {
+    private enum TelegramSendResult
+    {
+        Success,
+        TransientFailure,
+        PermanentFailure
+    }
+
     private readonly ILogger<Worker> _logger;
     private readonly IConfiguration _config;
     private readonly HttpClient _httpClient;
@@ -29,12 +36,19 @@ public class Worker : BackgroundService
     private DateTime _lastCaptureTime = DateTime.MinValue;
     private readonly TimeSpan _cooldown = TimeSpan.FromSeconds(2);
 
+    private readonly object _logLock = new();
+
     private long _lastUpdateId = 0;
     private readonly TimeSpan _pollInterval = TimeSpan.FromSeconds(5);
 
-    private volatile bool _forceImmediateRetry = false;
+    private CancellationTokenSource _retryWakeupCts = new();
+    private readonly object _wakeupLock = new();
 
     private EventLogWatcher? _watcher;
+
+    private Task? _cleanupTask;
+    private Task? _pollingTask;
+    private Task? _retryTask;
 
     public Worker(ILogger<Worker> logger, IConfiguration config, IHttpClientFactory httpClientFactory)
     {
@@ -43,7 +57,18 @@ public class Worker : BackgroundService
         _httpClient = httpClientFactory.CreateClient();
         _httpClient.Timeout = TimeSpan.FromSeconds(35);
 
-        // v0.6 configuration migration with graceful fallbacks
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
+            Directory.CreateDirectory(_captureDir);
+            Directory.CreateDirectory(_pendingDir);
+        }
+        catch
+        {
+            // Directory creation fallback handled in operations
+        }
+
+        // Configuration parsing with graceful fallbacks
         if (int.TryParse(_config["Camera:DeviceIndex"], out int camIdx) && camIdx >= 0)
         {
             _cameraIndex = camIdx;
@@ -74,34 +99,68 @@ public class Worker : BackgroundService
 
     private void Log(string message)
     {
-        try
+        lock (_logLock)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
-            File.AppendAllText(_logPath, $"{DateTime.Now:dd-MM-yyyy HH:mm:ss}: {message}{Environment.NewLine}");
-        }
-        catch
-        {
-            // Suppress file access collisions in logging
+            try
+            {
+                File.AppendAllText(_logPath, $"{DateTime.Now:dd-MM-yyyy HH:mm:ss}: {message}{Environment.NewLine}");
+            }
+            catch
+            {
+                // Suppress file access collisions in logging
+            }
         }
         _logger.LogInformation("{Message}", message);
     }
 
+    private void TriggerImmediateRetry()
+    {
+        lock (_wakeupLock)
+        {
+            try
+            {
+                _retryWakeupCts.Cancel();
+                _retryWakeupCts.Dispose();
+                _retryWakeupCts = new CancellationTokenSource();
+            }
+            catch
+            {
+                // Best effort wakeup
+            }
+        }
+    }
+
+    private async Task DelayWithWakeupAsync(TimeSpan delay, CancellationToken stoppingToken)
+    {
+        CancellationToken wakeupToken;
+        lock (_wakeupLock)
+        {
+            wakeupToken = _retryWakeupCts.Token;
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, wakeupToken);
+        try
+        {
+            await Task.Delay(delay, linkedCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            if (stoppingToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            // Woken up early by immediate retry trigger - return cleanly
+        }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        Directory.CreateDirectory(_captureDir);
         Log($"Service starting. Active camera index: {_cameraIndex}, Capture retention: {(_captureRetentionDays == -1 ? "Never" : $"{_captureRetentionDays} days")}, Log retention: {_logRetentionPeriod.TotalDays} days.");
 
         EnsureAuditPolicyEnabled();
         LogAvailableCameras();
 
-        NetworkChange.NetworkAvailabilityChanged += (s, e) =>
-        {
-            if (e.IsAvailable)
-            {
-                Log("Network connectivity detected — triggering immediate retry.");
-                _forceImmediateRetry = true;
-            }
-        };
+        NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
 
         try
         {
@@ -120,9 +179,9 @@ public class Worker : BackgroundService
             return;
         }
 
-        _ = RunPeriodicCleanupAsync(stoppingToken);
-        _ = RunTelegramPollingAsync(stoppingToken);
-        _ = RunPendingNotificationRetryAsync(stoppingToken);
+        _cleanupTask = RunPeriodicCleanupAsync(stoppingToken);
+        _pollingTask = RunTelegramPollingAsync(stoppingToken);
+        _retryTask = RunPendingNotificationRetryAsync(stoppingToken);
 
         try
         {
@@ -134,14 +193,58 @@ public class Worker : BackgroundService
         }
     }
 
+    private void OnNetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e)
+    {
+        if (e.IsAvailable)
+        {
+            Log("Network connectivity detected — triggering immediate retry.");
+            TriggerImmediateRetry();
+        }
+    }
+
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         Log("Service stopping...");
+
+        NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
+
         if (_watcher != null)
         {
-            _watcher.Enabled = false;
-            _watcher.Dispose();
+            try
+            {
+                _watcher.Enabled = false;
+                _watcher.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log($"Error disposing EventLogWatcher: {ex.Message}");
+            }
         }
+
+        TriggerImmediateRetry();
+
+        var backgroundTasks = new List<Task>();
+        if (_cleanupTask != null) backgroundTasks.Add(_cleanupTask);
+        if (_pollingTask != null) backgroundTasks.Add(_pollingTask);
+        if (_retryTask != null) backgroundTasks.Add(_retryTask);
+
+        if (backgroundTasks.Count > 0)
+        {
+            try
+            {
+                await Task.WhenAny(Task.WhenAll(backgroundTasks), Task.Delay(TimeSpan.FromSeconds(5), cancellationToken));
+            }
+            catch
+            {
+                // Best effort shutdown
+            }
+        }
+
+        lock (_wakeupLock)
+        {
+            try { _retryWakeupCts.Dispose(); } catch { }
+        }
+
         await base.StopAsync(cancellationToken);
     }
 
@@ -159,11 +262,22 @@ public class Worker : BackgroundService
             };
 
             using var checkProcess = Process.Start(checkInfo);
-            string output = checkProcess!.StandardOutput.ReadToEnd();
-            checkProcess.WaitForExit();
+            if (checkProcess == null)
+            {
+                Log("Audit policy check: could not start auditpol.exe process.");
+                return;
+            }
 
-            bool alreadyEnabled = output.Contains("Success and Failure") ||
-                                   (output.Contains("Success") && output.Contains("Failure"));
+            string output = checkProcess.StandardOutput.ReadToEnd();
+            if (!checkProcess.WaitForExit(10000))
+            {
+                try { checkProcess.Kill(); } catch { }
+                Log("Audit policy check: auditpol.exe query timed out after 10s. Continuing startup.");
+                return;
+            }
+
+            bool alreadyEnabled = output.Contains("Success and Failure", StringComparison.OrdinalIgnoreCase) ||
+                                   (output.Contains("Success", StringComparison.OrdinalIgnoreCase) && output.Contains("Failure", StringComparison.OrdinalIgnoreCase));
 
             if (alreadyEnabled)
             {
@@ -183,11 +297,22 @@ public class Worker : BackgroundService
             };
 
             using var setProcess = Process.Start(setInfo);
-            setProcess!.WaitForExit();
+            if (setProcess == null)
+            {
+                Log("Audit policy set: could not start auditpol.exe process.");
+                return;
+            }
+
+            if (!setProcess.WaitForExit(10000))
+            {
+                try { setProcess.Kill(); } catch { }
+                Log("Audit policy set: auditpol.exe set timed out after 10s. Continuing startup.");
+                return;
+            }
 
             Log(setProcess.ExitCode == 0
                 ? "Audit policy: successfully enabled Logon auditing."
-                : "Audit policy: auditpol /set returned non-zero. Manual setup may be required.");
+                : "Audit policy: auditpol /set returned non-zero. Manual setup may be required if non-English OS.");
         }
         catch (Exception ex)
         {
@@ -217,17 +342,23 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task<bool> TrySendTelegramNotificationAsync(string photoPath, string targetUser)
+    private async Task<TelegramSendResult> TrySendTelegramNotificationAsync(string photoPath, string targetUser, CancellationToken cancellationToken = default)
     {
         try
         {
-            string? token = _config["Telegram:BotToken"];
+            string? token = _config["Telegram:BotToken"]?.Trim();
             string? chatId = _config["Telegram:ChatId"]?.Trim();
 
             if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(chatId))
             {
                 Log("Telegram notification skipped: token or chat ID not configured.");
-                return true;
+                return TelegramSendResult.PermanentFailure;
+            }
+
+            if (!File.Exists(photoPath))
+            {
+                Log($"Telegram notification skipped: photo file not found at {photoPath}");
+                return TelegramSendResult.PermanentFailure;
             }
 
             string url = $"https://api.telegram.org/bot{token}/sendPhoto";
@@ -236,27 +367,40 @@ public class Worker : BackgroundService
             form.Add(new StringContent(chatId), "chat_id");
             form.Add(new StringContent($"⚠️ Failed login attempt detected (account: {targetUser}) at {DateTime.Now:yyyy-MM-dd HH:mm:ss}"), "caption");
 
-            byte[] photoBytes = await File.ReadAllBytesAsync(photoPath);
+            byte[] photoBytes = await File.ReadAllBytesAsync(photoPath, cancellationToken);
             var photoContent = new ByteArrayContent(photoBytes);
             photoContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/jpeg");
             form.Add(photoContent, "photo", Path.GetFileName(photoPath));
 
-            var response = await _httpClient.PostAsync(url, form);
+            var response = await _httpClient.PostAsync(url, form, cancellationToken);
 
             if (response.IsSuccessStatusCode)
             {
                 Log("Telegram notification sent successfully.");
-                return true;
+                return TelegramSendResult.Success;
             }
 
-            string responseBody = await response.Content.ReadAsStringAsync();
-            Log($"Telegram notification failed: {response.StatusCode} - {responseBody}");
-            return false;
+            int statusCode = (int)response.StatusCode;
+            string responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            Log($"Telegram notification failed: {response.StatusCode} ({statusCode}) - {responseBody}");
+
+            // 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found are permanent configuration issues
+            if (statusCode >= 400 && statusCode < 500 && statusCode != 429)
+            {
+                return TelegramSendResult.PermanentFailure;
+            }
+
+            // 429 Too Many Requests or 5xx Server Errors are transient
+            return TelegramSendResult.TransientFailure;
+        }
+        catch (OperationCanceledException)
+        {
+            return TelegramSendResult.TransientFailure;
         }
         catch (Exception ex)
         {
             Log($"Telegram notification exception: {ex.Message}");
-            return false;
+            return TelegramSendResult.TransientFailure;
         }
     }
 
@@ -266,7 +410,7 @@ public class Worker : BackgroundService
         {
             Directory.CreateDirectory(_pendingDir);
             string queueFile = Path.Combine(_pendingDir, $"{Path.GetFileNameWithoutExtension(photoPath)}.json");
-            var record = new { PhotoPath = photoPath, TargetUser = targetUser };
+            var record = new { PhotoPath = photoPath, TargetUser = targetUser, QueuedAt = DateTime.UtcNow };
             File.WriteAllText(queueFile, JsonSerializer.Serialize(record));
             Log($"Queued notification for retry: {Path.GetFileName(photoPath)}");
         }
@@ -294,31 +438,51 @@ public class Worker : BackgroundService
 
                     foreach (string queueFile in queueFiles)
                     {
+                        if (stoppingToken.IsCancellationRequested) break;
+
                         try
                         {
                             string json = await File.ReadAllTextAsync(queueFile, stoppingToken);
                             using var doc = JsonDocument.Parse(json);
-                            string photoPath = doc.RootElement.GetProperty("PhotoPath").GetString()!;
-                            string targetUser = doc.RootElement.GetProperty("TargetUser").GetString()!;
 
-                            if (!File.Exists(photoPath))
+                            if (!doc.RootElement.TryGetProperty("PhotoPath", out var photoProp) ||
+                                !doc.RootElement.TryGetProperty("TargetUser", out var userProp))
                             {
-                                Log($"Queued photo no longer exists (likely cleaned up): {Path.GetFileName(photoPath)}. Removing from queue.");
+                                Log($"Corrupt pending notification JSON: {Path.GetFileName(queueFile)}. Removing from queue.");
                                 File.Delete(queueFile);
                                 continue;
                             }
 
-                            bool sent = await TrySendTelegramNotificationAsync(photoPath, targetUser);
-                            if (sent)
+                            string photoPath = photoProp.GetString() ?? "";
+                            string targetUser = userProp.GetString() ?? "unknown";
+
+                            if (string.IsNullOrEmpty(photoPath) || !File.Exists(photoPath))
+                            {
+                                Log($"Queued photo no longer exists: {Path.GetFileName(photoPath)}. Removing from queue.");
+                                File.Delete(queueFile);
+                                continue;
+                            }
+
+                            var result = await TrySendTelegramNotificationAsync(photoPath, targetUser, stoppingToken);
+                            if (result == TelegramSendResult.Success)
                             {
                                 File.Delete(queueFile);
                                 Log($"Successfully sent queued notification: {Path.GetFileName(photoPath)}");
                             }
+                            else if (result == TelegramSendResult.PermanentFailure)
+                            {
+                                Log($"Permanent failure sending queued notification: {Path.GetFileName(photoPath)}. Removing from queue.");
+                                File.Delete(queueFile);
+                            }
                             else
                             {
+                                // Transient failure: leave file in queue, continue processing others
                                 anyFailureThisRound = true;
-                                break;
                             }
+                        }
+                        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                        {
+                            break;
                         }
                         catch (Exception ex)
                         {
@@ -327,6 +491,10 @@ public class Worker : BackgroundService
                         }
                     }
                 }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {
@@ -351,14 +519,9 @@ public class Worker : BackgroundService
 
             try
             {
-                if (_forceImmediateRetry)
-                {
-                    _forceImmediateRetry = false;
-                    currentDelay = TimeSpan.FromSeconds(1);
-                }
-                await Task.Delay(currentDelay, stoppingToken);
+                await DelayWithWakeupAsync(currentDelay, stoppingToken);
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
@@ -416,35 +579,70 @@ public class Worker : BackgroundService
         }
     }
 
-    private void RotateLogIfNeeded()
+    private void CleanupOldLogs()
     {
         try
         {
-            if (!File.Exists(_logPath))
+            string? logDir = Path.GetDirectoryName(_logPath);
+            if (string.IsNullOrEmpty(logDir) || !Directory.Exists(logDir)) return;
+
+            var oldLogs = Directory.GetFiles(logDir, "*.old");
+            DateTime cutoff = DateTime.Now - _logRetentionPeriod;
+
+            foreach (string oldLog in oldLogs)
             {
-                return;
-            }
-
-            DateTime logCreated = File.GetCreationTime(_logPath);
-
-            if (DateTime.Now - logCreated >= _logRetentionPeriod)
-            {
-                string archivePath = Path.Combine(
-                    Path.GetDirectoryName(_logPath)!,
-                    $"service_log_{logCreated:yyyyMMdd}.txt.old"
-                );
-
-                File.Move(_logPath, archivePath, overwrite: true);
-                Log($"Log rotated. Previous log archived as {Path.GetFileName(archivePath)}.");
+                try
+                {
+                    if (File.GetLastWriteTime(oldLog) < cutoff)
+                    {
+                        File.Delete(oldLog);
+                        Log($"Cleanup: removed archived log {Path.GetFileName(oldLog)}.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Cleanup: failed to delete archived log {Path.GetFileName(oldLog)}: {ex.Message}");
+                }
             }
         }
         catch (Exception ex)
         {
+            Log($"CleanupOldLogs exception: {ex.Message}");
+        }
+    }
+
+    private void RotateLogIfNeeded()
+    {
+        lock (_logLock)
+        {
             try
             {
-                File.AppendAllText(_logPath, $"{DateTime.Now:dd-MM-yyyy HH:mm:ss}: Log rotation failed: {ex.Message}{Environment.NewLine}");
+                if (!File.Exists(_logPath))
+                {
+                    return;
+                }
+
+                DateTime logCreated = File.GetCreationTime(_logPath);
+
+                if (DateTime.Now - logCreated >= _logRetentionPeriod)
+                {
+                    string archivePath = Path.Combine(
+                        Path.GetDirectoryName(_logPath)!,
+                        $"service_log_{logCreated:yyyyMMdd}.txt.old"
+                    );
+
+                    File.Move(_logPath, archivePath, overwrite: true);
+                    Log($"Log rotated. Previous log archived as {Path.GetFileName(archivePath)}.");
+                }
             }
-            catch { /* nothing more we can do */ }
+            catch (Exception ex)
+            {
+                try
+                {
+                    File.AppendAllText(_logPath, $"{DateTime.Now:dd-MM-yyyy HH:mm:ss}: Log rotation failed: {ex.Message}{Environment.NewLine}");
+                }
+                catch { /* suppress secondary exception */ }
+            }
         }
     }
 
@@ -454,6 +652,7 @@ public class Worker : BackgroundService
         {
             CleanupOldCaptures();
             RotateLogIfNeeded();
+            CleanupOldLogs();
 
             try
             {
@@ -480,8 +679,16 @@ public class Worker : BackgroundService
 
             using var frame = new Mat();
 
+            // Warmup: discard initial frames to allow camera auto-exposure and white balance to calibrate
+            for (int i = 0; i < 5; i++)
+            {
+                capture.Read(frame);
+                Thread.Sleep(30);
+            }
+
             bool gotFrame = false;
-            for (int attempt = 0; attempt < 30; attempt++)
+            // 60 attempts with 50ms sleep = up to 3.0s timeout waiting for camera hardware to yield a valid frame
+            for (int attempt = 0; attempt < 60; attempt++)
             {
                 capture.Read(frame);
                 if (!frame.Empty())
@@ -489,12 +696,12 @@ public class Worker : BackgroundService
                     gotFrame = true;
                     break;
                 }
-                Thread.Sleep(1);
+                Thread.Sleep(50);
             }
 
             if (!gotFrame)
             {
-                Log("CAPTURE FAILURE: Timed out waiting for frame.");
+                Log($"CAPTURE FAILURE: Timed out waiting for frame from camera index {_cameraIndex}.");
                 return;
             }
 
@@ -506,8 +713,8 @@ public class Worker : BackgroundService
 
             _ = Task.Run(async () =>
             {
-                bool sent = await TrySendTelegramNotificationAsync(filename, targetUser);
-                if (!sent)
+                var result = await TrySendTelegramNotificationAsync(filename, targetUser);
+                if (result != TelegramSendResult.Success)
                 {
                     QueuePendingNotification(filename, targetUser);
                 }
@@ -527,42 +734,66 @@ public class Worker : BackgroundService
             return;
         }
 
-        lock (_captureLock)
+        if (e.EventRecord == null)
         {
-            if (_captureInProgress)
-            {
-                Log("Capture already in progress — skipping this trigger.");
-                return;
-            }
-
-            if (DateTime.Now - _lastCaptureTime < _cooldown)
-            {
-                Log($"Trigger within cooldown window ({_cooldown.TotalSeconds}s) — skipping this trigger.");
-                return;
-            }
-
-            _captureInProgress = true;
+            return;
         }
 
         try
         {
-            string targetUser = GetEventDataValue(e.EventRecord, "TargetUserName") ?? "unknown";
-            string workstation = GetEventDataValue(e.EventRecord, "WorkstationName") ?? "unknown";
+            using (e.EventRecord)
+            {
+                string? logonTypeStr = GetEventDataValue(e.EventRecord, "LogonType");
 
-            Log($"Failed logon detected. Target account: {targetUser} (Workstation: {workstation}). Triggering capture...");
-            CaptureFrame(targetUser);
+                // Filter: only process Interactive (2), Unlock (7), and RemoteInteractive (10)
+                if (logonTypeStr != "2" && logonTypeStr != "7" && logonTypeStr != "10")
+                {
+                    // Non-interactive logons (e.g. network share scan LogonType 3, service LogonType 5) are ignored
+                    return;
+                }
+
+                lock (_captureLock)
+                {
+                    if (_captureInProgress)
+                    {
+                        Log("Capture already in progress — skipping this trigger.");
+                        return;
+                    }
+
+                    if (DateTime.Now - _lastCaptureTime < _cooldown)
+                    {
+                        Log($"Trigger within cooldown window ({_cooldown.TotalSeconds}s) — skipping this trigger.");
+                        return;
+                    }
+
+                    _captureInProgress = true;
+                }
+
+                try
+                {
+                    string targetUser = GetEventDataValue(e.EventRecord, "TargetUserName") ?? "unknown";
+                    string workstation = GetEventDataValue(e.EventRecord, "WorkstationName") ?? "unknown";
+
+                    Log($"Failed logon detected (LogonType {logonTypeStr}). Target account: {targetUser} (Workstation: {workstation}). Triggering capture...");
+                    Task.Run(() => CaptureFrame(targetUser));
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error handling event: {ex.Message}");
+                }
+                finally
+                {
+                    lock (_captureLock)
+                    {
+                        _captureInProgress = false;
+                        _lastCaptureTime = DateTime.Now;
+                    }
+                }
+            }
         }
         catch (Exception ex)
         {
-            Log($"Error handling event: {ex.Message}");
-        }
-        finally
-        {
-            lock (_captureLock)
-            {
-                _captureInProgress = false;
-                _lastCaptureTime = DateTime.Now;
-            }
+            Log($"OnFailedLogonEvent unhandled exception: {ex.Message}");
         }
     }
 
@@ -637,6 +868,10 @@ public class Worker : BackgroundService
                     }
                 }
             }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
             catch (Exception ex)
             {
                 consecutiveFailures++;
@@ -650,14 +885,9 @@ public class Worker : BackgroundService
 
             try
             {
-                if (_forceImmediateRetry)
-                {
-                    _forceImmediateRetry = false;
-                    currentDelay = TimeSpan.FromSeconds(1);
-                }
-                await Task.Delay(currentDelay, stoppingToken);
+                await DelayWithWakeupAsync(currentDelay, stoppingToken);
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
@@ -687,12 +917,17 @@ public class Worker : BackgroundService
         }
     }
 
-    private string? GetEventDataValue(EventRecord record, string dataName)
+    private string? GetEventDataValue(EventRecord? record, string dataName)
     {
+        if (record == null) return null;
+
         try
         {
+            string? xmlContent = record.ToXml();
+            if (string.IsNullOrEmpty(xmlContent)) return null;
+
             var xml = new System.Xml.XmlDocument();
-            xml.LoadXml(record.ToXml());
+            xml.LoadXml(xmlContent);
 
             var nsmgr = new System.Xml.XmlNamespaceManager(xml.NameTable);
             nsmgr.AddNamespace("ns", "http://schemas.microsoft.com/win/2004/08/events/event");
@@ -719,6 +954,9 @@ public class Worker : BackgroundService
 
     [DllImport("userenv.dll", SetLastError = true)]
     private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
+
+    [DllImport("userenv.dll", SetLastError = true)]
+    private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
 
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     private static extern bool CreateProcessAsUser(IntPtr hToken, string? lpApplicationName, System.Text.StringBuilder lpCommandLine,
@@ -764,6 +1002,7 @@ public class Worker : BackgroundService
     {
         IntPtr userToken = IntPtr.Zero;
         IntPtr dupToken = IntPtr.Zero;
+        IntPtr envBlock = IntPtr.Zero;
 
         try
         {
@@ -782,7 +1021,7 @@ public class Worker : BackgroundService
                 return false;
             }
 
-            CreateEnvironmentBlock(out IntPtr envBlock, dupToken, false);
+            CreateEnvironmentBlock(out envBlock, dupToken, false);
 
             var startupInfo = new STARTUPINFO();
             startupInfo.cb = Marshal.SizeOf(startupInfo);
@@ -812,6 +1051,7 @@ public class Worker : BackgroundService
         }
         finally
         {
+            if (envBlock != IntPtr.Zero) DestroyEnvironmentBlock(envBlock);
             if (dupToken != IntPtr.Zero) CloseHandle(dupToken);
             if (userToken != IntPtr.Zero) CloseHandle(userToken);
         }
