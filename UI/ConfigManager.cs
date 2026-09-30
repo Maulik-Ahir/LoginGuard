@@ -67,6 +67,12 @@ public static class ConfigManager
             config.Camera ??= new CameraConfig();
             config.Storage ??= new StorageConfig();
 
+            // Validate and sanitize camera index
+            if (config.Camera.DeviceIndex < 0)
+            {
+                config.Camera.DeviceIndex = 0;
+            }
+
             // Validate and sanitize presets with defaults on missing/corrupted values
             if (!AllowedCaptureRetentionPresets.Contains(config.Storage.CaptureRetentionDays))
             {
@@ -82,7 +88,7 @@ public static class ConfigManager
         }
         catch
         {
-            // On parse failure, return safe defaults rather than crashing
+            // On parse failure or I/O error, return safe defaults rather than crashing
             return new AppConfig();
         }
     }
@@ -90,8 +96,18 @@ public static class ConfigManager
     public static void Save(AppConfig config)
     {
         ArgumentNullException.ThrowIfNull(config);
+        config.Telegram ??= new TelegramConfig();
+        config.Camera ??= new CameraConfig();
+        config.Storage ??= new StorageConfig();
 
-        // Validation 1: Retention presets validation
+        // Validation 1: Camera device index validation
+        if (config.Camera.DeviceIndex < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(config.Camera.DeviceIndex),
+                "Camera device index must be greater than or equal to 0.");
+        }
+
+        // Validation 2: Retention presets validation
         if (!AllowedCaptureRetentionPresets.Contains(config.Storage.CaptureRetentionDays))
         {
             throw new ArgumentOutOfRangeException(nameof(config.Storage.CaptureRetentionDays),
@@ -104,7 +120,7 @@ public static class ConfigManager
                 $"Log retention must be one of the allowed presets: {string.Join(", ", AllowedLogRetentionPresets)}");
         }
 
-        // Validation 2: Telegram credentials validation
+        // Validation 3: Telegram credentials validation
         string token = config.Telegram.BotToken?.Trim() ?? string.Empty;
         string chatId = config.Telegram.ChatId?.Trim() ?? string.Empty;
 
@@ -113,9 +129,19 @@ public static class ConfigManager
             throw new ArgumentException("Telegram Bot Token cannot be empty.", nameof(config));
         }
 
+        if (!token.Contains(':') || token.Length < 20)
+        {
+            throw new ArgumentException("Telegram Bot Token format appears invalid. It should follow the format '123456789:ABCDefGhIJKlmNoPQRsTUVwxyZ'.", nameof(config));
+        }
+
         if (string.IsNullOrWhiteSpace(chatId))
         {
             throw new ArgumentException("Telegram Chat ID cannot be empty.", nameof(config));
+        }
+
+        if (!long.TryParse(chatId, out _))
+        {
+            throw new ArgumentException("Telegram Chat ID must be a numeric ID (e.g. 5635942580 or -100123456789).", nameof(config));
         }
 
         config.Telegram.BotToken = token;

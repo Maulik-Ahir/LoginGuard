@@ -32,21 +32,35 @@ public static class ServiceManager
 
     public static void Start(TimeSpan? timeout = null)
     {
+        TimeSpan opTimeout = timeout ?? DefaultTimeout;
         using var sc = new ServiceController(ServiceName);
-        if (sc.Status != ServiceControllerStatus.Running && sc.Status != ServiceControllerStatus.StartPending)
+        sc.Refresh();
+
+        if (sc.Status == ServiceControllerStatus.StartPending)
+        {
+            sc.WaitForStatus(ServiceControllerStatus.Running, opTimeout);
+        }
+        else if (sc.Status != ServiceControllerStatus.Running)
         {
             sc.Start();
-            sc.WaitForStatus(ServiceControllerStatus.Running, timeout ?? DefaultTimeout);
+            sc.WaitForStatus(ServiceControllerStatus.Running, opTimeout);
         }
     }
 
     public static void Stop(TimeSpan? timeout = null)
     {
+        TimeSpan opTimeout = timeout ?? DefaultTimeout;
         using var sc = new ServiceController(ServiceName);
-        if (sc.Status != ServiceControllerStatus.Stopped && sc.Status != ServiceControllerStatus.StopPending)
+        sc.Refresh();
+
+        if (sc.Status == ServiceControllerStatus.StopPending)
+        {
+            sc.WaitForStatus(ServiceControllerStatus.Stopped, opTimeout);
+        }
+        else if (sc.Status != ServiceControllerStatus.Stopped)
         {
             sc.Stop();
-            sc.WaitForStatus(ServiceControllerStatus.Stopped, timeout ?? DefaultTimeout);
+            sc.WaitForStatus(ServiceControllerStatus.Stopped, opTimeout);
         }
     }
 
@@ -54,14 +68,28 @@ public static class ServiceManager
     {
         TimeSpan opTimeout = timeout ?? DefaultTimeout;
         using var sc = new ServiceController(ServiceName);
+        sc.Refresh();
 
-        if (sc.Status != ServiceControllerStatus.Stopped)
+        if (sc.Status == ServiceControllerStatus.StopPending)
+        {
+            sc.WaitForStatus(ServiceControllerStatus.Stopped, opTimeout);
+            sc.Refresh();
+        }
+        else if (sc.Status != ServiceControllerStatus.Stopped)
         {
             sc.Stop();
             sc.WaitForStatus(ServiceControllerStatus.Stopped, opTimeout);
+            sc.Refresh();
         }
 
-        sc.Start();
-        sc.WaitForStatus(ServiceControllerStatus.Running, opTimeout);
+        if (sc.Status == ServiceControllerStatus.StartPending)
+        {
+            sc.WaitForStatus(ServiceControllerStatus.Running, opTimeout);
+        }
+        else if (sc.Status != ServiceControllerStatus.Running)
+        {
+            sc.Start();
+            sc.WaitForStatus(ServiceControllerStatus.Running, opTimeout);
+        }
     }
 }
