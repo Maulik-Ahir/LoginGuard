@@ -177,7 +177,7 @@ public partial class SettingsForm : Form
         }
     }
 
-    private void btnTestCapture_Click(object? sender, EventArgs e)
+    private async void btnTestCapture_Click(object? sender, EventArgs e)
     {
         int camIndex = 0;
         if (cboCamera.SelectedItem is CameraItem cam)
@@ -191,43 +191,58 @@ public partial class SettingsForm : Form
 
         try
         {
-            using var capture = new VideoCapture(camIndex, VideoCaptureAPIs.DSHOW);
-            if (!capture.IsOpened())
+            Bitmap? capturedBmp = await Task.Run(() =>
             {
-                lblCameraStatus.ForeColor = System.Drawing.Color.Red;
-                lblCameraStatus.Text = $"❌ Could not open camera (index {camIndex}).";
-                return;
-            }
-
-            using var frame = new Mat();
-            bool gotFrame = false;
-            for (int attempt = 0; attempt < 30; attempt++)
-            {
-                capture.Read(frame);
-                if (!frame.Empty())
+                using var capture = new VideoCapture(camIndex, VideoCaptureAPIs.DSHOW);
+                if (!capture.IsOpened())
                 {
-                    gotFrame = true;
-                    break;
+                    return null;
                 }
-                Thread.Sleep(5);
-            }
 
-            if (!gotFrame)
+                using var frame = new Mat();
+
+                // Warmup frames
+                for (int i = 0; i < 5; i++)
+                {
+                    capture.Read(frame);
+                    Thread.Sleep(30);
+                }
+
+                bool gotFrame = false;
+                for (int attempt = 0; attempt < 40; attempt++)
+                {
+                    capture.Read(frame);
+                    if (!frame.Empty())
+                    {
+                        gotFrame = true;
+                        break;
+                    }
+                    Thread.Sleep(50);
+                }
+
+                if (!gotFrame)
+                {
+                    return null;
+                }
+
+                Cv2.ImEncode(".bmp", frame, out byte[] buf);
+                using var ms = new MemoryStream(buf);
+                return new Bitmap(ms);
+            });
+
+            if (capturedBmp == null)
             {
                 lblCameraStatus.ForeColor = System.Drawing.Color.Red;
-                lblCameraStatus.Text = "❌ Timed out waiting for frame.";
+                lblCameraStatus.Text = $"❌ Could not capture frame from camera {camIndex}.";
                 return;
             }
 
-            // Display in PictureBox via memory buffer
-            Cv2.ImEncode(".bmp", frame, out byte[] buf);
-            using var ms = new MemoryStream(buf);
             var oldImage = picPreview.Image;
-            picPreview.Image = new Bitmap(ms);
+            picPreview.Image = capturedBmp;
             oldImage?.Dispose();
 
             lblCameraStatus.ForeColor = System.Drawing.Color.FromArgb(16, 124, 65);
-            lblCameraStatus.Text = $"✅ Frame captured: {frame.Width}x{frame.Height} px.";
+            lblCameraStatus.Text = $"✅ Frame captured: {capturedBmp.Width}x{capturedBmp.Height} px.";
         }
         catch (Exception ex)
         {
@@ -281,12 +296,13 @@ public partial class SettingsForm : Form
         RefreshServiceStatus();
     }
 
-    private void btnStartService_Click(object? sender, EventArgs e)
+    private async void btnStartService_Click(object? sender, EventArgs e)
     {
+        btnStartService.Enabled = false;
         Cursor = Cursors.WaitCursor;
         try
         {
-            ServiceManager.Start();
+            await Task.Run(() => ServiceManager.Start());
             RefreshServiceStatus();
         }
         catch (Exception ex)
@@ -296,20 +312,22 @@ public partial class SettingsForm : Form
         finally
         {
             Cursor = Cursors.Default;
+            RefreshServiceStatus();
         }
     }
 
-    private void btnStopService_Click(object? sender, EventArgs e)
+    private async void btnStopService_Click(object? sender, EventArgs e)
     {
         if (MessageBox.Show("Are you sure you want to stop LoginGuardService? Security monitoring will pause.", "Confirm Stop", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
         {
             return;
         }
 
+        btnStopService.Enabled = false;
         Cursor = Cursors.WaitCursor;
         try
         {
-            ServiceManager.Stop();
+            await Task.Run(() => ServiceManager.Stop());
             RefreshServiceStatus();
         }
         catch (Exception ex)
@@ -319,15 +337,17 @@ public partial class SettingsForm : Form
         finally
         {
             Cursor = Cursors.Default;
+            RefreshServiceStatus();
         }
     }
 
-    private void btnRestartService_Click(object? sender, EventArgs e)
+    private async void btnRestartService_Click(object? sender, EventArgs e)
     {
+        btnRestartService.Enabled = false;
         Cursor = Cursors.WaitCursor;
         try
         {
-            ServiceManager.Restart();
+            await Task.Run(() => ServiceManager.Restart());
             RefreshServiceStatus();
         }
         catch (Exception ex)
@@ -337,10 +357,11 @@ public partial class SettingsForm : Form
         finally
         {
             Cursor = Cursors.Default;
+            RefreshServiceStatus();
         }
     }
 
-    private void btnSave_Click(object? sender, EventArgs e)
+    private async void btnSave_Click(object? sender, EventArgs e)
     {
         string token = txtBotToken.Text.Trim();
         string chatId = txtChatId.Text.Trim();
@@ -353,11 +374,27 @@ public partial class SettingsForm : Form
             return;
         }
 
+        if (!token.Contains(':') || token.Length < 20)
+        {
+            tabControl.SelectedTab = tabTelegram;
+            txtBotToken.Focus();
+            MessageBox.Show("Telegram Bot Token format appears invalid. It should follow the format '123456789:ABCDefGhIJKlmNoPQRsTUVwxyZ'.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(chatId))
         {
             tabControl.SelectedTab = tabTelegram;
             txtChatId.Focus();
             MessageBox.Show("Please provide a valid Authorized Chat ID.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!long.TryParse(chatId, out _))
+        {
+            tabControl.SelectedTab = tabTelegram;
+            txtChatId.Focus();
+            MessageBox.Show("Telegram Chat ID must be a numeric ID (e.g. 5635942580 or -100123456789).", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -387,7 +424,7 @@ public partial class SettingsForm : Form
                 Cursor = Cursors.WaitCursor;
                 try
                 {
-                    ServiceManager.Restart();
+                    await Task.Run(() => ServiceManager.Restart());
                     MessageBox.Show("LoginGuardService restarted successfully with new settings.", "Service Restarted", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 catch (Exception ex)

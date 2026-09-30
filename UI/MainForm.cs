@@ -8,6 +8,7 @@ public partial class MainForm : Form
     private readonly string _logPath = @"C:\CameraSpikeLog\service_log.txt";
     private readonly string _captureDir = @"C:\CameraSpikeLog\Captures";
     private long _lastLogLength = 0;
+    private bool _viewManuallyCleared = false;
 
     public MainForm()
     {
@@ -57,11 +58,17 @@ public partial class MainForm : Form
         try
         {
             var fileInfo = new FileInfo(_logPath);
-            if (fileInfo.Length == _lastLogLength && lvwActivity.Items.Count > 0)
+            if (fileInfo.Length == _lastLogLength && !_viewManuallyCleared && lvwActivity.Items.Count > 0)
             {
                 return; // Nothing changed
             }
 
+            if (_viewManuallyCleared && fileInfo.Length == _lastLogLength)
+            {
+                return; // Keep view cleared until new log lines arrive
+            }
+
+            _viewManuallyCleared = false;
             _lastLogLength = fileInfo.Length;
 
             // Read safely allowing concurrent writes from the Service
@@ -183,7 +190,7 @@ public partial class MainForm : Form
         }
         else if (raw.Contains("Cleanup: removed", StringComparison.OrdinalIgnoreCase))
         {
-            friendly = "🧹 Periodic cleanup: purged expired photos";
+            friendly = "🧹 Periodic cleanup: purged expired photos/logs";
             color = Color.DimGray;
         }
         else
@@ -222,12 +229,14 @@ public partial class MainForm : Form
 
     private void btnRefreshLog_Click(object? sender, EventArgs e)
     {
+        _viewManuallyCleared = false;
         UpdateServiceStatusHeader();
         LoadLogFile();
     }
 
     private void btnClearView_Click(object? sender, EventArgs e)
     {
+        _viewManuallyCleared = true;
         lvwActivity.Items.Clear();
         lblEventCount.Text = "View cleared (log file on disk preserved)";
     }
