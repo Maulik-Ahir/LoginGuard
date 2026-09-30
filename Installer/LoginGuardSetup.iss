@@ -5,7 +5,7 @@
 ; =====================================================================
 
 #define MyAppName "LoginGuard"
-#define MyAppVersion "0.6.0"
+#define MyAppVersion "0.7.0"
 #define MyAppPublisher "Maulik"
 #define MyAppExeName "LoginGuardUI.exe"
 
@@ -62,6 +62,10 @@ Filename: "{app}\UI\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppNam
 Filename: "{sys}\sc.exe"; Parameters: "stop LoginGuardService"; Flags: runhidden; RunOnceId: "StopLoginGuardService"
 Filename: "{sys}\sc.exe"; Parameters: "delete LoginGuardService"; Flags: runhidden; RunOnceId: "DeleteLoginGuardService"
 
+[UninstallDelete]
+Type: files; Name: "{app}\Service\appsettings.Secrets.json"
+Type: files; Name: "{app}\Service\*.tmp*"
+
 [Code]
 var
   TelegramPage: TInputQueryWizardPage;
@@ -76,7 +80,7 @@ begin
     'LoginGuard uses a Telegram bot to send instant evidence photos and receive remote /lock commands.' + #13#10 +
     'These credentials are saved locally to appsettings.Secrets.json and are never shared or sent to external servers.'
   );
-  TelegramPage.Add('Telegram Bot Token:', False);
+  TelegramPage.Add('Telegram Bot Token:', True);
   TelegramPage.Add('Authorized Chat ID:', False);
 end;
 
@@ -92,6 +96,12 @@ begin
     TokenVal := Trim(TelegramPage.Values[0]);
     ChatIdVal := Trim(TelegramPage.Values[1]);
     SecretsFile := ExpandConstant('{app}\Service\appsettings.Secrets.json');
+
+    // Sanitize string escaping for JSON
+    StringChange(TokenVal, '\', '\\');
+    StringChange(TokenVal, '"', '\"');
+    StringChange(ChatIdVal, '\', '\\');
+    StringChange(ChatIdVal, '"', '\"');
 
     // Generate appsettings.Secrets.json with provided credentials or defaults
     JsonContent := 
