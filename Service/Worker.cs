@@ -48,9 +48,12 @@ public class Worker : BackgroundService
 
     private EventLogWatcher? _watcher;
 
+    private readonly UsbStorageDetector _usbDetector = new();
+
     private Task? _cleanupTask;
     private Task? _pollingTask;
     private Task? _retryTask;
+    private Task? _usbMonitoringTask;
 
     public Worker(ILogger<Worker> logger, IConfiguration config, IHttpClientFactory httpClientFactory)
     {
@@ -185,6 +188,12 @@ public class Worker : BackgroundService
         _cleanupTask = RunPeriodicCleanupAsync(stoppingToken);
         _pollingTask = RunTelegramPollingAsync(stoppingToken);
         _retryTask = RunPendingNotificationRetryAsync(stoppingToken);
+        _usbMonitoringTask = RunUsbMonitoringAsync(stoppingToken);
+
+        _ = Task.Run(async () =>
+        {
+            await CheckAndRecordRecentSystemEventsAsync(stoppingToken);
+        }, stoppingToken);
 
         try
         {
@@ -230,6 +239,7 @@ public class Worker : BackgroundService
         if (_cleanupTask != null) backgroundTasks.Add(_cleanupTask);
         if (_pollingTask != null) backgroundTasks.Add(_pollingTask);
         if (_retryTask != null) backgroundTasks.Add(_retryTask);
+        if (_usbMonitoringTask != null) backgroundTasks.Add(_usbMonitoringTask);
 
         if (backgroundTasks.Count > 0)
         {
@@ -1077,6 +1087,10 @@ public class Worker : BackgroundService
                 await SendSimpleTelegramMessageAsync(TelegramCommandHandler.FormatPending(_pendingDir));
                 break;
 
+            case "/usb":
+                await SendSimpleTelegramMessageAsync(TelegramCommandHandler.FormatRecentUsbActivity(_historyDir));
+                break;
+
             case "/lock":
                 Log("Remote lock command received. Locking active session now.");
                 bool locked = LockActiveSessionAsUser();
@@ -1094,13 +1108,136 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task SendSimpleTelegramMessageAsync(string text)
+    private async Task RunUsbMonitoringAsync(CancellationToken stoppingToken)
+    {
+        Log("USB removable storage monitoring started.");
+        _usbDetector.InitializeFromCurrentDrives();
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var newIncidents = _usbDetector.DetectNewInsertions();
+                foreach (var incident in newIncidents)
+                {
+                    Log($"USB Storage Inserted: {incident.DeviceName} on {incident.DriveLetter} (Incident: {incident.IncidentId})");
+                    IncidentRepository.SaveIncident(_historyDir, incident);
+
+                    // Send Telegram alert
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            string msg = TelegramCommandHandler.FormatUsbAlert(incident);
+                            bool sent = await SendSimpleTelegramMessageAsync(msg);
+                            if (sent)
+                            {
+                                incident.NotificationStatus = NotificationStatus.Sent;
+                                incident.NotificationAttempts = 1;
+                                incident.LastNotificationAttempt = DateTime.UtcNow;
+                                IncidentRepository.SaveIncident(_historyDir, incident);
+                                Log($"USB Telegram alert sent successfully for {incident.DriveLetter}");
+                            }
+                            else
+                            {
+                                incident.NotificationStatus = NotificationStatus.PermanentFailure;
+                                incident.LastNotificationError = "Failed sending Telegram alert";
+                                IncidentRepository.SaveIncident(_historyDir, incident);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Failed sending USB Telegram notification: {ex.Message}");
+                        }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"USB monitoring error: {ex.Message}");
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+    }
+
+    private async Task CheckAndRecordRecentSystemEventsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            Log("Checking recent Windows shutdown/restart system events...");
+            var existingIncidents = IncidentRepository.LoadAllIncidents(_historyDir);
+            var recentEvents = SystemEventDetector.QueryRecentShutdownEvents(TimeSpan.FromHours(24));
+
+            // Process from oldest to newest so history is chronological
+            recentEvents.Reverse();
+
+            foreach (var ev in recentEvents)
+            {
+                if (cancellationToken.IsCancellationRequested) break;
+
+                if (SystemEventDetector.IsDuplicateEvent(existingIncidents, ev.Timestamp, ev.EventType))
+                {
+                    continue;
+                }
+
+                var incident = new Incident
+                {
+                    IncidentId = Guid.NewGuid(),
+                    DetectedAt = ev.Timestamp,
+                    EventType = ev.EventType,
+                    TargetUser = ev.InitiatingUser ?? "SYSTEM",
+                    Workstation = Environment.MachineName,
+                    LogonType = 0,
+                    CaptureStatus = CaptureStatus.NotApplicable,
+                    CapturePath = null,
+                    NotificationStatus = NotificationStatus.NotAttempted,
+                    Details = ev.Details
+                };
+
+                IncidentRepository.SaveIncident(_historyDir, incident);
+                existingIncidents.Add(incident);
+                Log($"Recorded {ev.EventType}: at {ev.Timestamp:yyyy-MM-dd HH:mm:ss} — {ev.Details}");
+
+                try
+                {
+                    string alertMsg = SystemEventDetector.FormatSystemEventAlert(incident);
+                    bool sent = await SendSimpleTelegramMessageAsync(alertMsg);
+                    if (sent)
+                    {
+                        incident.NotificationStatus = NotificationStatus.Sent;
+                        incident.NotificationAttempts = 1;
+                        incident.LastNotificationAttempt = DateTime.UtcNow;
+                        IncidentRepository.SaveIncident(_historyDir, incident);
+                        Log($"Telegram alert sent for system event {incident.EventType}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"Failed sending Telegram alert for system event: {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Error analyzing system events: {ex.Message}");
+        }
+    }
+
+    private async Task<bool> SendSimpleTelegramMessageAsync(string text)
     {
         try
         {
             string? token = _config["Telegram:BotToken"]?.Trim();
             string? chatId = _config["Telegram:ChatId"]?.Trim();
-            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(chatId)) return;
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(chatId)) return false;
 
             string url = $"https://api.telegram.org/bot{token}/sendMessage";
             var content = new FormUrlEncodedContent(new[]
@@ -1109,11 +1246,13 @@ public class Worker : BackgroundService
                 new KeyValuePair<string, string>("text", text)
             });
 
-            await _httpClient.PostAsync(url, content);
+            var response = await _httpClient.PostAsync(url, content);
+            return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
         {
             Log($"Failed to send confirmation message: {ex.Message}");
+            return false;
         }
     }
 

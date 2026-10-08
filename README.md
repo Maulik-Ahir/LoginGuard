@@ -1,18 +1,34 @@
 # LoginGuard
 
-**LoginGuard** is a Windows security utility and background service that monitors failed interactive logon attempts (Windows Security Event ID 4625), captures an evidence photo via the laptop's webcam, delivers instant Telegram alerts with the photo, and allows the authorized owner to remotely lock their laptop using the `/lock` command.
+**LoginGuard** is a Windows security utility and background service that monitors failed interactive logon attempts (Windows Security Event ID 4625), captures evidence photos via the laptop's webcam, detects USB removable storage insertions, tracks Windows system shutdown/restart events, delivers instant Telegram alerts, and allows the authorized owner to remotely lock their laptop using the `/lock` command.
 
 ---
 
 ## Key Features
 
 - **Automated Intruder Capture**: Detects failed password and PIN attempts (Interactive, Unlock, and Remote Desktop logins) and silently photographs the person in front of the screen.
-- **Instant Telegram Alerts**: Sends the evidence capture and timestamped metadata directly to your authorized Telegram chat.
+- **USB Storage Insertion Detection**: Monitors for newly connected USB flash drives and removable storage volumes, recording device labels and drive letters, and sending instant Telegram alerts (webcam is not triggered for USB events).
+- **System Shutdown & Restart Tracking**: Analyzes and logs Windows shutdown and restart events (clean shutdowns, user restarts, and unexpected crashes/power cuts) using event log inspection with duplicate prevention.
+- **Instant Telegram Alerts**: Sends evidence captures and metadata directly to your authorized Telegram chat.
 - **Offline Resilience**: Automatically queues notifications locally if internet access is down, and retries with exponential backoff and instant wakeup upon network reconnection.
-- **Remote Telegram Interface**: Expand remote interaction from `/lock` into a full monitoring bot supporting `/status`, `/last` (with photo), `/history`, `/pending`, and `/help`.
-- **Structured Incident History & UI**: Stores each detected failed logon as structured JSON in a dedicated history repository and provides a comprehensive "Incident History" tab in the UI with filtering, details pane, and direct capture viewing.
+- **Remote Telegram Interface**: Full remote monitoring bot supporting `/status`, `/last` (with photo), `/history`, `/pending`, `/usb`, and `/lock`.
+- **Structured Incident History & UI**: Stores each detected failed logon, USB insertion, and system event as structured JSON in a dedicated history repository and provides a comprehensive "Incident History" tab in the UI with event-type filtering, details pane, and direct capture viewing.
 - **Local Privacy & Data Retention**: Configurable automated cleanup of older captures, incident history records, and log files. Evidence is stored locally on the machine.
 - **Settings & Monitoring UI**: Windows Forms management console for live event logs, incident history, camera testing, Telegram testing, and service lifecycle control.
+
+---
+
+## Physical Security & System Monitoring Details
+
+### USB Storage Monitoring
+- **Detection**: Continuously monitors the workstation for newly mounted removable drives (`DriveType.Removable`).
+- **Data Logged**: Drive letter, volume label, filesystem format, and timestamp.
+- **Webcam Privacy**: USB insertion does **not** capture a webcam photo.
+- **Telegram Command**: Use `/usb` to review recent removable storage activity.
+
+### Shutdown & Restart Tracking
+- **Detection**: Analyzes Windows System event logs (Event ID 1074, 6008, 41) upon service start to detect previous normal shutdowns, user restarts, and unexpected power losses.
+- **Known Limitations**: Windows shutdown can terminate background services before every runtime hook is processed. Detection is explicitly treated as **best-effort** and leverages startup event log auditing to prevent dropped alerts or false positives.
 
 ---
 
@@ -101,6 +117,13 @@ dotnet test Tests/ConfigManagerTests/ConfigManagerTests.csproj
 
 ## Version History
 
+- **v0.9.0**: Physical Security Monitoring & System Tracking:
+  - USB removable storage insertion detection with volume metadata extraction, history persistence, and instant Telegram alert.
+  - Windows System shutdown and restart detection (clean shutdowns, user restarts, and unexpected power outages) via startup analysis and EventLog inspection.
+  - Multi-event Incident model: unified tracking across FailedLogins, USB insertions, and System events.
+  - Incident History UI tab updated with event-type filters (Failed Logins, USB, Shutdown/Restart) and dedicated details view.
+  - New Telegram command: `/usb` for reviewing recent removable storage activity.
+  - Fully backward compatible with existing v0.8 incident archives.
 - **v0.8.0**: Incident History & Telegram expansion:
   - Persistent, file-based structured incident JSON repository in `C:\CameraSpikeLog\History\`.
   - Dedicated Incident History UI tab with table view, metadata inspection, filter presets, and capture viewer.

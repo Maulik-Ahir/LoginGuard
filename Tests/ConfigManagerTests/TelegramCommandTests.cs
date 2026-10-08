@@ -73,6 +73,7 @@ public class TelegramCommandTests : IDisposable
     [InlineData("/last", true)]
     [InlineData("/history", true)]
     [InlineData("/pending", true)]
+    [InlineData("/usb", true)]
     [InlineData("/lock", true)]
     [InlineData("/unlock", false)]
     [InlineData("/delete", false)]
@@ -107,6 +108,7 @@ public class TelegramCommandTests : IDisposable
         Assert.Contains("/last", help);
         Assert.Contains("/history", help);
         Assert.Contains("/pending", help);
+        Assert.Contains("/usb", help);
         Assert.Contains("/lock", help);
         Assert.Contains("/help", help);
     }

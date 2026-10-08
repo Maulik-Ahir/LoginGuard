@@ -32,7 +32,7 @@ public static class TelegramCommandHandler
 
     public static bool IsKnownCommand(string command)
     {
-        return command is "/help" or "/status" or "/last" or "/history" or "/pending" or "/lock";
+        return command is "/help" or "/status" or "/last" or "/history" or "/pending" or "/lock" or "/usb";
     }
 
     // ── /help ──────────────────────────────────────────────
@@ -45,6 +45,7 @@ public static class TelegramCommandHandler
             "/last — latest incident\n" +
             "/history — recent incidents\n" +
             "/pending — pending notifications\n" +
+            "/usb — recent USB activity\n" +
             "/lock — lock the active Windows session\n" +
             "/help — show available commands";
     }
@@ -95,14 +96,36 @@ public static class TelegramCommandHandler
             string captureStatusText = FormatCaptureStatusEmoji(latest.CaptureStatus);
             string notifStatusText = FormatNotificationStatusEmoji(latest.NotificationStatus);
 
-            string message =
-                "🔍 Latest Incident\n\n" +
-                $"Time: {latest.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n" +
-                $"Account: {latest.TargetUser}\n" +
-                $"Logon Type: {FormatLogonType(latest.LogonType)}\n" +
-                $"Workstation: {latest.Workstation}\n" +
-                $"Capture: {captureStatusText}\n" +
-                $"Telegram: {notifStatusText}";
+            string message;
+            if (latest.EventType == SecurityEventType.USBStorageInserted)
+            {
+                message =
+                    "🔍 Latest Incident: USB Storage Inserted\n\n" +
+                    $"Time: {latest.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n" +
+                    $"Device: {latest.DeviceName ?? "USB Drive"}\n" +
+                    $"Drive: {latest.DriveLetter ?? "Unknown"}\n" +
+                    (string.IsNullOrEmpty(latest.VolumeLabel) ? "" : $"Volume: {latest.VolumeLabel}\n") +
+                    $"Telegram: {notifStatusText}";
+            }
+            else if (latest.EventType is SecurityEventType.Shutdown or SecurityEventType.Restart or SecurityEventType.UnexpectedShutdown)
+            {
+                message =
+                    $"🔍 Latest Incident: {latest.EventType}\n\n" +
+                    $"Time: {latest.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n" +
+                    $"Details: {latest.Details ?? "(none)"}\n" +
+                    $"Telegram: {notifStatusText}";
+            }
+            else
+            {
+                message =
+                    "🔍 Latest Incident\n\n" +
+                    $"Time: {latest.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n" +
+                    $"Account: {latest.TargetUser}\n" +
+                    $"Logon Type: {FormatLogonType(latest.LogonType)}\n" +
+                    $"Workstation: {latest.Workstation}\n" +
+                    $"Capture: {captureStatusText}\n" +
+                    $"Telegram: {notifStatusText}";
+            }
 
             string? capturePath = null;
             if (latest.CaptureStatus == CaptureStatus.Success &&
@@ -145,12 +168,40 @@ public static class TelegramCommandHandler
             {
                 var inc = incidents[i];
                 string time = inc.DetectedAt.ToLocalTime().ToString("HH:mm");
-                string capEmoji = inc.CaptureStatus == CaptureStatus.Success ? "✅" :
-                                  inc.CaptureStatus == CaptureStatus.Failed ? "❌" : "⏳";
                 string notifEmoji = inc.NotificationStatus == NotificationStatus.Sent ? "✅" :
-                                    inc.NotificationStatus == NotificationStatus.PermanentFailure ? "❌" : "⏳";
+                                    inc.NotificationStatus == NotificationStatus.PermanentFailure ? "❌" :
+                                    inc.NotificationStatus == NotificationStatus.NotAttempted ? "—" : "⏳";
 
-                lines.Add($"{i + 1}. {time} — {inc.TargetUser} — {FormatLogonType(inc.LogonType)} — 📷 {capEmoji} — Telegram {notifEmoji}");
+                if (inc.EventType == SecurityEventType.USBStorageInserted)
+                {
+                    string dev = !string.IsNullOrWhiteSpace(inc.VolumeLabel)
+                        ? inc.VolumeLabel
+                        : (!string.IsNullOrWhiteSpace(inc.DeviceName) ? inc.DeviceName : "USB Drive");
+                    string drive = inc.DriveLetter ?? "?";
+                    lines.Add($"{i + 1}. {time} — 🔌 USB: {dev} ({drive}) — Telegram {notifEmoji}");
+                }
+                else if (inc.EventType == SecurityEventType.Shutdown)
+                {
+                    lines.Add($"{i + 1}. {time} — ⚫ Shutdown — Telegram {notifEmoji}");
+                }
+                else if (inc.EventType == SecurityEventType.Restart)
+                {
+                    lines.Add($"{i + 1}. {time} — 🔄 Restart — Telegram {notifEmoji}");
+                }
+                else if (inc.EventType == SecurityEventType.UnexpectedShutdown)
+                {
+                    lines.Add($"{i + 1}. {time} — ⚠️ Unexpected Shutdown — Telegram {notifEmoji}");
+                }
+                else if (inc.EventType == SecurityEventType.RemoteLock)
+                {
+                    lines.Add($"{i + 1}. {time} — 🔒 Remote Lock — Telegram {notifEmoji}");
+                }
+                else
+                {
+                    string capEmoji = inc.CaptureStatus == CaptureStatus.Success ? "✅" :
+                                      inc.CaptureStatus == CaptureStatus.Failed ? "❌" : "⏳";
+                    lines.Add($"{i + 1}. {time} — {inc.TargetUser} — {FormatLogonType(inc.LogonType)} — 📷 {capEmoji} — Telegram {notifEmoji}");
+                }
             }
 
             if (incidents.Count > maxCount)
@@ -164,6 +215,59 @@ public static class TelegramCommandHandler
         {
             return "⚠️ Error reading incident history.";
         }
+    }
+
+    // ── /usb ───────────────────────────────────────────────
+
+    public static string FormatRecentUsbActivity(string historyDir, int maxCount = 5)
+    {
+        try
+        {
+            var incidents = IncidentRepository.LoadAllIncidents(historyDir);
+            var usbEvents = incidents.Where(i => i.EventType == SecurityEventType.USBStorageInserted).ToList();
+
+            if (usbEvents.Count == 0)
+            {
+                return "No USB activity recorded.";
+            }
+
+            var lines = new List<string> { "Recent USB Activity\n" };
+            int count = Math.Min(usbEvents.Count, maxCount);
+
+            for (int i = 0; i < count; i++)
+            {
+                var ev = usbEvents[i];
+                string time = ev.DetectedAt.ToLocalTime().ToString("HH:mm");
+                string dev = !string.IsNullOrWhiteSpace(ev.VolumeLabel)
+                    ? ev.VolumeLabel
+                    : (!string.IsNullOrWhiteSpace(ev.DeviceName) ? ev.DeviceName : "USB Drive");
+                string drive = ev.DriveLetter ?? "?";
+
+                lines.Add($"{i + 1}. {time} — {dev} — {drive}");
+            }
+
+            return string.Join("\n", lines);
+        }
+        catch
+        {
+            return "⚠️ Error reading USB activity.";
+        }
+    }
+
+    public static string FormatUsbAlert(Incident incident)
+    {
+        string device = !string.IsNullOrWhiteSpace(incident.VolumeLabel)
+            ? incident.VolumeLabel
+            : (!string.IsNullOrWhiteSpace(incident.DeviceName) ? incident.DeviceName : "USB Drive");
+
+        string drive = incident.DriveLetter ?? "Unknown";
+        string time = incident.DetectedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+
+        return
+            "🔌 USB Storage Detected\n\n" +
+            $"Device: {device}\n" +
+            $"Drive: {drive}\n" +
+            $"Time: {time}";
     }
 
     // ── /pending ───────────────────────────────────────────

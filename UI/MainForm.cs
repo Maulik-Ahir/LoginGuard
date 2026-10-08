@@ -209,6 +209,31 @@ public partial class MainForm : Form
             friendly = "🧹 Periodic cleanup: purged expired photos/logs";
             color = Color.DimGray;
         }
+        else if (raw.Contains("USB Storage Inserted", StringComparison.OrdinalIgnoreCase))
+        {
+            friendly = "🔌 USB removable drive inserted";
+            color = Color.DarkGoldenrod;
+        }
+        else if (raw.Contains("USB Telegram alert sent", StringComparison.OrdinalIgnoreCase))
+        {
+            friendly = "🟢 Telegram alert sent for USB storage";
+            color = Color.FromArgb(16, 124, 65);
+        }
+        else if (raw.Contains("Shutdown detected", StringComparison.OrdinalIgnoreCase) || raw.Contains("System Shutdown", StringComparison.OrdinalIgnoreCase))
+        {
+            friendly = "⚫ System shutdown detected";
+            color = Color.DarkSlateBlue;
+        }
+        else if (raw.Contains("Restart detected", StringComparison.OrdinalIgnoreCase) || raw.Contains("System Restart", StringComparison.OrdinalIgnoreCase))
+        {
+            friendly = "🔄 System restart detected";
+            color = Color.DarkOrange;
+        }
+        else if (raw.Contains("Unexpected shutdown", StringComparison.OrdinalIgnoreCase))
+        {
+            friendly = "⚠️ Previous system shutdown was unexpected";
+            color = Color.DarkRed;
+        }
         else
         {
             friendly = $"ℹ️ {raw}";
@@ -274,9 +299,13 @@ public partial class MainForm : Form
     private void SetupIncidentHistoryTab()
     {
         // Populate filter combo
+        cboHistoryFilter.Items.Clear();
         cboHistoryFilter.Items.AddRange(new object[]
         {
-            "All",
+            "All Events",
+            "Failed Logins Only",
+            "USB Activity Only",
+            "Shutdown / Restart Only",
             "Capture Successful",
             "Capture Failed",
             "Telegram Sent",
@@ -288,14 +317,14 @@ public partial class MainForm : Form
         // Setup DataGridView columns
         dgvIncidents.Columns.Clear();
         dgvIncidents.Columns.Add("colTime", "Time");
-        dgvIncidents.Columns.Add("colUser", "User");
-        dgvIncidents.Columns.Add("colLogonType", "Logon Type");
+        dgvIncidents.Columns.Add("colEvent", "Event");
+        dgvIncidents.Columns.Add("colDetails", "Details");
         dgvIncidents.Columns.Add("colCapture", "Capture");
         dgvIncidents.Columns.Add("colTelegram", "Telegram");
 
-        dgvIncidents.Columns["colTime"]!.FillWeight = 25;
-        dgvIncidents.Columns["colUser"]!.FillWeight = 20;
-        dgvIncidents.Columns["colLogonType"]!.FillWeight = 25;
+        dgvIncidents.Columns["colTime"]!.FillWeight = 20;
+        dgvIncidents.Columns["colEvent"]!.FillWeight = 20;
+        dgvIncidents.Columns["colDetails"]!.FillWeight = 30;
         dgvIncidents.Columns["colCapture"]!.FillWeight = 15;
         dgvIncidents.Columns["colTelegram"]!.FillWeight = 15;
 
@@ -325,11 +354,14 @@ public partial class MainForm : Form
         // Map combo index to filter enum
         var filter = cboHistoryFilter.SelectedIndex switch
         {
-            1 => IncidentHistoryHelper.IncidentFilter.CaptureSuccessful,
-            2 => IncidentHistoryHelper.IncidentFilter.CaptureFailed,
-            3 => IncidentHistoryHelper.IncidentFilter.TelegramSent,
-            4 => IncidentHistoryHelper.IncidentFilter.TelegramPending,
-            5 => IncidentHistoryHelper.IncidentFilter.TelegramFailed,
+            1 => IncidentHistoryHelper.IncidentFilter.FailedLoginsOnly,
+            2 => IncidentHistoryHelper.IncidentFilter.UsbOnly,
+            3 => IncidentHistoryHelper.IncidentFilter.ShutdownRestartOnly,
+            4 => IncidentHistoryHelper.IncidentFilter.CaptureSuccessful,
+            5 => IncidentHistoryHelper.IncidentFilter.CaptureFailed,
+            6 => IncidentHistoryHelper.IncidentFilter.TelegramSent,
+            7 => IncidentHistoryHelper.IncidentFilter.TelegramPending,
+            8 => IncidentHistoryHelper.IncidentFilter.TelegramFailed,
             _ => IncidentHistoryHelper.IncidentFilter.All
         };
 
@@ -349,8 +381,8 @@ public partial class MainForm : Form
         {
             int rowIdx = dgvIncidents.Rows.Add(
                 inc.DetectedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
-                inc.TargetUser,
-                IncidentHistoryHelper.FormatLogonType(inc.LogonType),
+                IncidentHistoryHelper.FormatEventType(inc.EventType),
+                IncidentHistoryHelper.FormatEventDetails(inc),
                 IncidentHistoryHelper.FormatCaptureStatus(inc.CaptureStatus),
                 IncidentHistoryHelper.FormatNotificationStatus(inc.NotificationStatus)
             );
@@ -367,6 +399,7 @@ public partial class MainForm : Form
 
         lblSummaryStats.Text = $"Total: {summary.TotalIncidents}  |  " +
                                $"Captures: {summary.SuccessfulCaptures}  |  " +
+                               $"USB: {summary.UsbEvents}  |  " +
                                $"Sent: {summary.TelegramSent}  |  " +
                                $"Pending: {summary.TelegramPending}";
         lblSummaryLatest.Text = $"Latest: {summary.LatestIncidentInfo}";
@@ -391,18 +424,43 @@ public partial class MainForm : Form
         var inc = _selectedIncident;
         var lines = new List<string>
         {
+            $"Event Type:             {IncidentHistoryHelper.FormatEventType(inc.EventType)}",
             $"Incident ID:            {inc.IncidentId}",
             $"Detected At:            {inc.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
-            $"Target User:            {inc.TargetUser}",
-            $"Workstation:            {inc.Workstation}",
-            $"Logon Type:             {IncidentHistoryHelper.FormatLogonType(inc.LogonType)}",
-            $"Capture Status:         {IncidentHistoryHelper.FormatCaptureStatus(inc.CaptureStatus)}",
-            $"Capture Path:           {inc.CapturePath ?? "(none)"}",
-            $"Notification Status:    {IncidentHistoryHelper.FormatNotificationStatus(inc.NotificationStatus)}",
-            $"Notification Attempts:  {inc.NotificationAttempts}",
-            $"Last Attempt:           {(inc.LastNotificationAttempt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "(none)")}",
         };
 
+        if (inc.EventType == SecurityEventType.USBStorageInserted)
+        {
+            lines.Add($"Device / Volume:        {inc.DeviceName ?? "(unknown)"}");
+            lines.Add($"Drive Letter:           {inc.DriveLetter ?? "(unknown)"}");
+            if (!string.IsNullOrEmpty(inc.VolumeLabel))
+                lines.Add($"Volume Label:           {inc.VolumeLabel}");
+            if (!string.IsNullOrEmpty(inc.Details))
+                lines.Add($"Details:                {inc.Details}");
+        }
+        else if (inc.EventType is SecurityEventType.Shutdown or SecurityEventType.Restart or SecurityEventType.UnexpectedShutdown)
+        {
+            lines.Add($"Details:                {inc.Details ?? "(none)"}");
+        }
+        else
+        {
+            lines.Add($"Target User:            {inc.TargetUser}");
+            lines.Add($"Workstation:            {inc.Workstation}");
+            lines.Add($"Logon Type:             {IncidentHistoryHelper.FormatLogonType(inc.LogonType)}");
+        }
+
+        lines.Add($"Capture Status:         {IncidentHistoryHelper.FormatCaptureStatus(inc.CaptureStatus)}");
+        if (!string.IsNullOrEmpty(inc.CapturePath))
+        {
+            lines.Add($"Capture Path:           {inc.CapturePath}");
+        }
+
+        lines.Add($"Notification Status:    {IncidentHistoryHelper.FormatNotificationStatus(inc.NotificationStatus)}");
+        lines.Add($"Notification Attempts:  {inc.NotificationAttempts}");
+        if (inc.LastNotificationAttempt.HasValue)
+        {
+            lines.Add($"Last Attempt:           {inc.LastNotificationAttempt.Value.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+        }
         if (!string.IsNullOrEmpty(inc.LastNotificationError))
         {
             lines.Add($"Last Error:             {inc.LastNotificationError}");
@@ -429,6 +487,13 @@ public partial class MainForm : Form
         if (_selectedIncident == null)
         {
             MessageBox.Show("Please select an incident first.", "No Selection",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (_selectedIncident.CaptureStatus == CaptureStatus.NotApplicable)
+        {
+            MessageBox.Show("Webcam captures are not recorded for this event type.", "No Capture",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
