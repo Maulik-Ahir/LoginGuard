@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.ServiceProcess;
+using LoginGuardService;
 
 namespace LoginGuardUI;
 
@@ -7,8 +8,14 @@ public partial class MainForm : Form
 {
     private readonly string _logPath = @"C:\CameraSpikeLog\service_log.txt";
     private readonly string _captureDir = @"C:\CameraSpikeLog\Captures";
+    private readonly string _historyDir = @"C:\CameraSpikeLog\History";
     private long _lastLogLength = 0;
     private bool _viewManuallyCleared = false;
+
+    // Incident history state
+    private List<Incident> _allIncidents = new();
+    private List<Incident> _filteredIncidents = new();
+    private Incident? _selectedIncident;
 
     public MainForm()
     {
@@ -19,8 +26,13 @@ public partial class MainForm : Form
     {
         UpdateServiceStatusHeader();
         LoadLogFile();
+        SetupIncidentHistoryTab();
         refreshTimer.Start();
     }
+
+    // ══════════════════════════════════════════════════════
+    //  EXISTING: Service status header
+    // ══════════════════════════════════════════════════════
 
     private void UpdateServiceStatusHeader()
     {
@@ -46,6 +58,10 @@ public partial class MainForm : Form
             lblHeaderServiceStatus.ForeColor = Color.Khaki;
         }
     }
+
+    // ══════════════════════════════════════════════════════
+    //  EXISTING: Activity Log
+    // ══════════════════════════════════════════════════════
 
     private void LoadLogFile()
     {
@@ -202,6 +218,10 @@ public partial class MainForm : Form
         return (timestamp, friendly, raw, color);
     }
 
+    // ══════════════════════════════════════════════════════
+    //  EXISTING: Activity Log toolbar
+    // ══════════════════════════════════════════════════════
+
     private void btnOpenCaptures_Click(object? sender, EventArgs e)
     {
         try
@@ -245,5 +265,202 @@ public partial class MainForm : Form
     {
         UpdateServiceStatusHeader();
         LoadLogFile();
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  NEW: Incident History
+    // ══════════════════════════════════════════════════════
+
+    private void SetupIncidentHistoryTab()
+    {
+        // Populate filter combo
+        cboHistoryFilter.Items.AddRange(new object[]
+        {
+            "All",
+            "Capture Successful",
+            "Capture Failed",
+            "Telegram Sent",
+            "Telegram Pending/Queued",
+            "Telegram Failed"
+        });
+        cboHistoryFilter.SelectedIndex = 0;
+
+        // Setup DataGridView columns
+        dgvIncidents.Columns.Clear();
+        dgvIncidents.Columns.Add("colTime", "Time");
+        dgvIncidents.Columns.Add("colUser", "User");
+        dgvIncidents.Columns.Add("colLogonType", "Logon Type");
+        dgvIncidents.Columns.Add("colCapture", "Capture");
+        dgvIncidents.Columns.Add("colTelegram", "Telegram");
+
+        dgvIncidents.Columns["colTime"]!.FillWeight = 25;
+        dgvIncidents.Columns["colUser"]!.FillWeight = 20;
+        dgvIncidents.Columns["colLogonType"]!.FillWeight = 25;
+        dgvIncidents.Columns["colCapture"]!.FillWeight = 15;
+        dgvIncidents.Columns["colTelegram"]!.FillWeight = 15;
+
+        // Set alternating row colors for readability
+        dgvIncidents.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(245, 247, 250);
+
+        // Load initial data
+        LoadIncidentHistory();
+    }
+
+    private void LoadIncidentHistory()
+    {
+        try
+        {
+            _allIncidents = IncidentRepository.LoadAllIncidents(_historyDir);
+        }
+        catch (Exception)
+        {
+            _allIncidents = new List<Incident>();
+        }
+
+        ApplyFilterAndRefreshGrid();
+    }
+
+    private void ApplyFilterAndRefreshGrid()
+    {
+        // Map combo index to filter enum
+        var filter = cboHistoryFilter.SelectedIndex switch
+        {
+            1 => IncidentHistoryHelper.IncidentFilter.CaptureSuccessful,
+            2 => IncidentHistoryHelper.IncidentFilter.CaptureFailed,
+            3 => IncidentHistoryHelper.IncidentFilter.TelegramSent,
+            4 => IncidentHistoryHelper.IncidentFilter.TelegramPending,
+            5 => IncidentHistoryHelper.IncidentFilter.TelegramFailed,
+            _ => IncidentHistoryHelper.IncidentFilter.All
+        };
+
+        _filteredIncidents = IncidentHistoryHelper.ApplyFilter(_allIncidents, filter);
+
+        // Populate grid
+        dgvIncidents.Rows.Clear();
+
+        if (_filteredIncidents.Count == 0)
+        {
+            // Show a placeholder message via the summary
+            txtDetails.Text = "Select an incident to view details.";
+            _selectedIncident = null;
+        }
+
+        foreach (var inc in _filteredIncidents)
+        {
+            int rowIdx = dgvIncidents.Rows.Add(
+                inc.DetectedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                inc.TargetUser,
+                IncidentHistoryHelper.FormatLogonType(inc.LogonType),
+                IncidentHistoryHelper.FormatCaptureStatus(inc.CaptureStatus),
+                IncidentHistoryHelper.FormatNotificationStatus(inc.NotificationStatus)
+            );
+            dgvIncidents.Rows[rowIdx].Tag = inc;
+        }
+
+        // Update summary
+        UpdateSummary();
+    }
+
+    private void UpdateSummary()
+    {
+        var summary = IncidentHistoryHelper.CalculateSummary(_allIncidents);
+
+        lblSummaryStats.Text = $"Total: {summary.TotalIncidents}  |  " +
+                               $"Captures: {summary.SuccessfulCaptures}  |  " +
+                               $"Sent: {summary.TelegramSent}  |  " +
+                               $"Pending: {summary.TelegramPending}";
+        lblSummaryLatest.Text = $"Latest: {summary.LatestIncidentInfo}";
+    }
+
+    private void dgvIncidents_SelectionChanged(object? sender, EventArgs e)
+    {
+        if (dgvIncidents.SelectedRows.Count == 0)
+        {
+            _selectedIncident = null;
+            txtDetails.Text = "Select an incident to view details.";
+            return;
+        }
+
+        _selectedIncident = dgvIncidents.SelectedRows[0].Tag as Incident;
+        if (_selectedIncident == null)
+        {
+            txtDetails.Text = "Unable to load incident details.";
+            return;
+        }
+
+        var inc = _selectedIncident;
+        var lines = new List<string>
+        {
+            $"Incident ID:            {inc.IncidentId}",
+            $"Detected At:            {inc.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
+            $"Target User:            {inc.TargetUser}",
+            $"Workstation:            {inc.Workstation}",
+            $"Logon Type:             {IncidentHistoryHelper.FormatLogonType(inc.LogonType)}",
+            $"Capture Status:         {IncidentHistoryHelper.FormatCaptureStatus(inc.CaptureStatus)}",
+            $"Capture Path:           {inc.CapturePath ?? "(none)"}",
+            $"Notification Status:    {IncidentHistoryHelper.FormatNotificationStatus(inc.NotificationStatus)}",
+            $"Notification Attempts:  {inc.NotificationAttempts}",
+            $"Last Attempt:           {(inc.LastNotificationAttempt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "(none)")}",
+        };
+
+        if (!string.IsNullOrEmpty(inc.LastNotificationError))
+        {
+            lines.Add($"Last Error:             {inc.LastNotificationError}");
+        }
+
+        lines.Add($"Created At:             {inc.CreatedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+        lines.Add($"Updated At:             {inc.UpdatedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}");
+
+        txtDetails.Text = string.Join(Environment.NewLine, lines);
+    }
+
+    private void btnRefreshHistory_Click(object? sender, EventArgs e)
+    {
+        LoadIncidentHistory();
+    }
+
+    private void cboHistoryFilter_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        ApplyFilterAndRefreshGrid();
+    }
+
+    private void btnOpenCapture_Click(object? sender, EventArgs e)
+    {
+        if (_selectedIncident == null)
+        {
+            MessageBox.Show("Please select an incident first.", "No Selection",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (string.IsNullOrEmpty(_selectedIncident.CapturePath))
+        {
+            MessageBox.Show("No capture file is associated with this incident.",
+                "Capture Unavailable", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!File.Exists(_selectedIncident.CapturePath))
+        {
+            MessageBox.Show(
+                "Capture unavailable — file may have been removed by retention cleanup.\n\n" +
+                $"Expected path: {_selectedIncident.CapturePath}",
+                "Capture Not Found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = _selectedIncident.CapturePath,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not open capture file: {ex.Message}",
+                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 }

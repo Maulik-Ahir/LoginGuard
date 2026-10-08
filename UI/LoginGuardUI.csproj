@@ -17,4 +17,8 @@
     <PackageReference Include="OpenCvSharp4.Windows" Version="4.10.0.20241108" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\Service\LoginGuardService.csproj" />
+  </ItemGroup>
+
 </Project>

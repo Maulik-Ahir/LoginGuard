@@ -5,7 +5,7 @@
 ; =====================================================================
 
 #define MyAppName "LoginGuard"
-#define MyAppVersion "0.7.0"
+#define MyAppVersion "0.8.0"
 #define MyAppPublisher "Maulik"
 #define MyAppExeName "LoginGuardUI.exe"
 
@@ -47,6 +47,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\UI\{#MyAppExeName}"; Tasks:
 [Dirs]
 Name: "{sd}\CameraSpikeLog\Captures"; Permissions: system-full admins-full
 Name: "{sd}\CameraSpikeLog\PendingNotifications"; Permissions: system-full admins-full
+Name: "{sd}\CameraSpikeLog\History"; Permissions: system-full admins-full
 
 [Run]
 ; Register and configure Windows Service

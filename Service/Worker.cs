@@ -23,10 +23,12 @@ public class Worker : BackgroundService
     private readonly string _logPath = @"C:\CameraSpikeLog\service_log.txt";
     private readonly string _captureDir = @"C:\CameraSpikeLog\Captures";
     private readonly string _pendingDir = @"C:\CameraSpikeLog\PendingNotifications";
+    private readonly string _historyDir = @"C:\CameraSpikeLog\History";
 
     // Dynamic configuration with battle-tested fallback defaults
     private readonly int _cameraIndex = 0;
     private readonly int _captureRetentionDays = 30; // -1 represents "Never"
+    private readonly int _historyRetentionDays = 30;
     private readonly TimeSpan _cleanupInterval = TimeSpan.FromDays(1);
     private readonly TimeSpan _retryInterval = TimeSpan.FromSeconds(30);
     private readonly TimeSpan _logRetentionPeriod = TimeSpan.FromDays(15);
@@ -62,6 +64,7 @@ public class Worker : BackgroundService
             Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
             Directory.CreateDirectory(_captureDir);
             Directory.CreateDirectory(_pendingDir);
+            Directory.CreateDirectory(_historyDir);
         }
         catch
         {
@@ -404,13 +407,19 @@ public class Worker : BackgroundService
         }
     }
 
-    private void QueuePendingNotification(string photoPath, string targetUser)
+    private void QueuePendingNotification(string photoPath, string targetUser, Guid? incidentId = null)
     {
         try
         {
             Directory.CreateDirectory(_pendingDir);
             string queueFile = Path.Combine(_pendingDir, $"{Path.GetFileNameWithoutExtension(photoPath)}.json");
-            var record = new { PhotoPath = photoPath, TargetUser = targetUser, QueuedAt = DateTime.UtcNow };
+            var record = new
+            {
+                IncidentId = incidentId,
+                PhotoPath = photoPath,
+                TargetUser = targetUser,
+                QueuedAt = DateTime.UtcNow
+            };
             File.WriteAllText(queueFile, JsonSerializer.Serialize(record));
             Log($"Queued notification for retry: {Path.GetFileName(photoPath)}");
         }
@@ -455,10 +464,27 @@ public class Worker : BackgroundService
 
                             string photoPath = photoProp.GetString() ?? "";
                             string targetUser = userProp.GetString() ?? "unknown";
+                            Guid? incidentId = null;
+                            if (doc.RootElement.TryGetProperty("IncidentId", out var incProp) &&
+                                incProp.ValueKind == JsonValueKind.String &&
+                                Guid.TryParse(incProp.GetString(), out Guid parsedId))
+                            {
+                                incidentId = parsedId;
+                            }
 
                             if (string.IsNullOrEmpty(photoPath) || !File.Exists(photoPath))
                             {
                                 Log($"Queued photo no longer exists: {Path.GetFileName(photoPath)}. Removing from queue.");
+                                if (incidentId.HasValue)
+                                {
+                                    var inc = IncidentRepository.GetIncidentById(_historyDir, incidentId.Value);
+                                    if (inc != null)
+                                    {
+                                        inc.NotificationStatus = NotificationStatus.PermanentFailure;
+                                        inc.LastNotificationError = "Queued photo no longer exists";
+                                        IncidentRepository.SaveIncident(_historyDir, inc);
+                                    }
+                                }
                                 File.Delete(queueFile);
                                 continue;
                             }
@@ -466,17 +492,52 @@ public class Worker : BackgroundService
                             var result = await TrySendTelegramNotificationAsync(photoPath, targetUser, stoppingToken);
                             if (result == TelegramSendResult.Success)
                             {
+                                if (incidentId.HasValue)
+                                {
+                                    var inc = IncidentRepository.GetIncidentById(_historyDir, incidentId.Value);
+                                    if (inc != null)
+                                    {
+                                        inc.NotificationStatus = NotificationStatus.Sent;
+                                        inc.NotificationAttempts++;
+                                        inc.LastNotificationAttempt = DateTime.UtcNow;
+                                        inc.LastNotificationError = null;
+                                        IncidentRepository.SaveIncident(_historyDir, inc);
+                                    }
+                                }
                                 File.Delete(queueFile);
                                 Log($"Successfully sent queued notification: {Path.GetFileName(photoPath)}");
                             }
                             else if (result == TelegramSendResult.PermanentFailure)
                             {
+                                if (incidentId.HasValue)
+                                {
+                                    var inc = IncidentRepository.GetIncidentById(_historyDir, incidentId.Value);
+                                    if (inc != null)
+                                    {
+                                        inc.NotificationStatus = NotificationStatus.PermanentFailure;
+                                        inc.NotificationAttempts++;
+                                        inc.LastNotificationAttempt = DateTime.UtcNow;
+                                        inc.LastNotificationError = "Permanent failure sending Telegram notification";
+                                        IncidentRepository.SaveIncident(_historyDir, inc);
+                                    }
+                                }
                                 Log($"Permanent failure sending queued notification: {Path.GetFileName(photoPath)}. Removing from queue.");
                                 File.Delete(queueFile);
                             }
                             else
                             {
-                                // Transient failure: leave file in queue, continue processing others
+                                // Transient failure: leave file in queue, update incident attempt count
+                                if (incidentId.HasValue)
+                                {
+                                    var inc = IncidentRepository.GetIncidentById(_historyDir, incidentId.Value);
+                                    if (inc != null)
+                                    {
+                                        inc.NotificationStatus = NotificationStatus.Retrying;
+                                        inc.NotificationAttempts++;
+                                        inc.LastNotificationAttempt = DateTime.UtcNow;
+                                        IncidentRepository.SaveIncident(_historyDir, inc);
+                                    }
+                                }
                                 anyFailureThisRound = true;
                             }
                         }
@@ -579,6 +640,22 @@ public class Worker : BackgroundService
         }
     }
 
+    private void CleanupOldHistory()
+    {
+        try
+        {
+            int deleted = IncidentRepository.CleanupOldHistory(_historyDir, _historyRetentionDays);
+            if (deleted > 0)
+            {
+                Log($"Cleanup: removed {deleted} incident history record(s) older than {_historyRetentionDays} days.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Cleanup history exception: {ex.Message}");
+        }
+    }
+
     private void CleanupOldLogs()
     {
         try
@@ -651,6 +728,7 @@ public class Worker : BackgroundService
         while (!stoppingToken.IsCancellationRequested)
         {
             CleanupOldCaptures();
+            CleanupOldHistory();
             RotateLogIfNeeded();
             CleanupOldLogs();
 
@@ -665,7 +743,7 @@ public class Worker : BackgroundService
         }
     }
 
-    private void CaptureFrame(string targetUser = "unknown")
+    private void CaptureFrame(string targetUser, Incident incident)
     {
         try
         {
@@ -674,6 +752,8 @@ public class Worker : BackgroundService
             if (!capture.IsOpened())
             {
                 Log($"CAPTURE FAILURE: Could not open camera (index {_cameraIndex}).");
+                incident.CaptureStatus = CaptureStatus.Failed;
+                IncidentRepository.SaveIncident(_historyDir, incident);
                 return;
             }
 
@@ -702,6 +782,8 @@ public class Worker : BackgroundService
             if (!gotFrame)
             {
                 Log($"CAPTURE FAILURE: Timed out waiting for frame from camera index {_cameraIndex}.");
+                incident.CaptureStatus = CaptureStatus.Failed;
+                IncidentRepository.SaveIncident(_historyDir, incident);
                 return;
             }
 
@@ -711,18 +793,41 @@ public class Worker : BackgroundService
             frame.SaveImage(filename);
             Log($"CAPTURE SUCCESS: Saved {filename}");
 
+            incident.CaptureStatus = CaptureStatus.Success;
+            incident.CapturePath = filename;
+            IncidentRepository.SaveIncident(_historyDir, incident);
+
             _ = Task.Run(async () =>
             {
+                incident.NotificationAttempts++;
+                incident.LastNotificationAttempt = DateTime.UtcNow;
+
                 var result = await TrySendTelegramNotificationAsync(filename, targetUser);
-                if (result != TelegramSendResult.Success)
+                if (result == TelegramSendResult.Success)
                 {
-                    QueuePendingNotification(filename, targetUser);
+                    incident.NotificationStatus = NotificationStatus.Sent;
+                    incident.LastNotificationError = null;
+                    IncidentRepository.SaveIncident(_historyDir, incident);
+                }
+                else if (result == TelegramSendResult.PermanentFailure)
+                {
+                    incident.NotificationStatus = NotificationStatus.PermanentFailure;
+                    incident.LastNotificationError = "Permanent failure sending Telegram notification";
+                    IncidentRepository.SaveIncident(_historyDir, incident);
+                }
+                else
+                {
+                    incident.NotificationStatus = NotificationStatus.Queued;
+                    IncidentRepository.SaveIncident(_historyDir, incident);
+                    QueuePendingNotification(filename, targetUser, incident.IncidentId);
                 }
             });
         }
         catch (Exception ex)
         {
             Log($"CAPTURE EXCEPTION: {ex.Message}");
+            incident.CaptureStatus = CaptureStatus.Failed;
+            IncidentRepository.SaveIncident(_historyDir, incident);
         }
     }
 
@@ -773,9 +878,23 @@ public class Worker : BackgroundService
                 {
                     string targetUser = GetEventDataValue(e.EventRecord, "TargetUserName") ?? "unknown";
                     string workstation = GetEventDataValue(e.EventRecord, "WorkstationName") ?? "unknown";
+                    int logonType = int.TryParse(logonTypeStr, out int lt) ? lt : 0;
 
-                    Log($"Failed logon detected (LogonType {logonTypeStr}). Target account: {targetUser} (Workstation: {workstation}). Triggering capture...");
-                    Task.Run(() => CaptureFrame(targetUser));
+                    var incident = new Incident
+                    {
+                        IncidentId = Guid.NewGuid(),
+                        DetectedAt = DateTime.UtcNow,
+                        TargetUser = targetUser,
+                        Workstation = workstation,
+                        LogonType = logonType,
+                        CaptureStatus = CaptureStatus.Pending,
+                        NotificationStatus = NotificationStatus.NotAttempted
+                    };
+
+                    IncidentRepository.SaveIncident(_historyDir, incident);
+
+                    Log($"Failed logon detected (LogonType {logonTypeStr}). Target account: {targetUser} (Workstation: {workstation}). Incident: {incident.IncidentId}. Triggering capture...");
+                    Task.Run(() => CaptureFrame(targetUser, incident));
                 }
                 catch (Exception ex)
                 {
@@ -804,11 +923,11 @@ public class Worker : BackgroundService
 
         if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(allowedChatId))
         {
-            Log("Remote lock polling skipped: Telegram not configured.");
+            Log("Telegram command polling skipped: Telegram not configured.");
             return;
         }
 
-        Log("Remote lock polling started.");
+        Log("Telegram command polling started.");
 
         int consecutiveFailures = 0;
         TimeSpan currentDelay = _pollInterval;
@@ -825,7 +944,7 @@ public class Worker : BackgroundService
                 {
                     if (consecutiveFailures > 0)
                     {
-                        Log("Connection restored — remote lock listening resumed normally.");
+                        Log("Connection restored — Telegram command listening resumed normally.");
                     }
                     consecutiveFailures = 0;
                     currentDelay = _pollInterval;
@@ -837,32 +956,33 @@ public class Worker : BackgroundService
                     {
                         foreach (var update in results.EnumerateArray())
                         {
-                            long updateId = update.GetProperty("update_id").GetInt64();
-                            _lastUpdateId = Math.Max(_lastUpdateId, updateId);
-
-                            if (!update.TryGetProperty("message", out var message))
-                                continue;
-
-                            string senderChatId = message.GetProperty("chat").GetProperty("id").GetInt64().ToString();
-
-                            if (senderChatId != allowedChatId)
+                            try
                             {
-                                Log($"Ignored command from unauthorized chat ID: {senderChatId}");
-                                continue;
+                                long updateId = update.GetProperty("update_id").GetInt64();
+                                _lastUpdateId = Math.Max(_lastUpdateId, updateId);
+
+                                if (!update.TryGetProperty("message", out var message))
+                                    continue;
+
+                                string senderChatId = message.GetProperty("chat").GetProperty("id").GetInt64().ToString();
+
+                                if (senderChatId != allowedChatId)
+                                {
+                                    Log($"Ignored command from unauthorized chat ID: {senderChatId}");
+                                    continue;
+                                }
+
+                                if (!message.TryGetProperty("text", out var textElement))
+                                    continue;
+
+                                string rawText = textElement.GetString() ?? "";
+                                string command = TelegramCommandHandler.ParseCommand(rawText);
+
+                                await HandleTelegramCommandAsync(command);
                             }
-
-                            if (!message.TryGetProperty("text", out var textElement))
-                                continue;
-
-                            string text = textElement.GetString()?.Trim().ToLowerInvariant() ?? "";
-
-                            if (text == "/lock")
+                            catch (Exception ex)
                             {
-                                Log("Remote lock command received. Locking active session now.");
-                                bool locked = LockActiveSessionAsUser();
-                                await SendSimpleTelegramMessageAsync(locked
-                                    ? "🔒 Laptop locked successfully."
-                                    : "⚠️ Lock command received but failed — check service_log.txt.");
+                                Log($"Error processing Telegram update: {ex.Message}");
                             }
                         }
                     }
@@ -894,6 +1014,86 @@ public class Worker : BackgroundService
         }
     }
 
+    private async Task HandleTelegramCommandAsync(string command)
+    {
+        switch (command)
+        {
+            case "/help":
+                await SendSimpleTelegramMessageAsync(TelegramCommandHandler.FormatHelp());
+                break;
+
+            case "/status":
+                int pendingCount = 0;
+                try
+                {
+                    if (Directory.Exists(_pendingDir))
+                        pendingCount = Directory.GetFiles(_pendingDir, "*.json").Length;
+                }
+                catch { }
+
+                string? lastIncidentTime = null;
+                string? lastNotifStatus = null;
+                try
+                {
+                    var incidents = IncidentRepository.LoadAllIncidents(_historyDir);
+                    if (incidents.Count > 0)
+                    {
+                        lastIncidentTime = incidents[0].DetectedAt.ToLocalTime().ToString("HH:mm:ss");
+                        lastNotifStatus = incidents[0].NotificationStatus switch
+                        {
+                            NotificationStatus.Sent => "Sent",
+                            NotificationStatus.Queued => "Queued",
+                            NotificationStatus.Retrying => "Retrying",
+                            NotificationStatus.PermanentFailure => "Failed",
+                            NotificationStatus.NotAttempted => "Not Attempted",
+                            _ => "Unknown"
+                        };
+                    }
+                }
+                catch { }
+
+                await SendSimpleTelegramMessageAsync(
+                    TelegramCommandHandler.FormatStatus(_cameraIndex, pendingCount, lastIncidentTime, lastNotifStatus));
+                break;
+
+            case "/last":
+                var lastResult = TelegramCommandHandler.FormatLastIncident(_historyDir);
+                if (lastResult.CaptureFilePath != null)
+                {
+                    // Send the capture photo with the incident text as caption
+                    await SendTelegramPhotoAsync(lastResult.CaptureFilePath, lastResult.Message);
+                }
+                else
+                {
+                    await SendSimpleTelegramMessageAsync(lastResult.Message);
+                }
+                break;
+
+            case "/history":
+                await SendSimpleTelegramMessageAsync(TelegramCommandHandler.FormatHistory(_historyDir));
+                break;
+
+            case "/pending":
+                await SendSimpleTelegramMessageAsync(TelegramCommandHandler.FormatPending(_pendingDir));
+                break;
+
+            case "/lock":
+                Log("Remote lock command received. Locking active session now.");
+                bool locked = LockActiveSessionAsUser();
+                await SendSimpleTelegramMessageAsync(locked
+                    ? "🔒 Laptop locked successfully."
+                    : "⚠️ Lock command received but failed — check service_log.txt.");
+                break;
+
+            default:
+                if (command.StartsWith("/"))
+                {
+                    await SendSimpleTelegramMessageAsync(TelegramCommandHandler.FormatUnknownCommand());
+                }
+                break;
+        }
+    }
+
     private async Task SendSimpleTelegramMessageAsync(string text)
     {
         try
@@ -914,6 +1114,46 @@ public class Worker : BackgroundService
         catch (Exception ex)
         {
             Log($"Failed to send confirmation message: {ex.Message}");
+        }
+    }
+
+    private async Task SendTelegramPhotoAsync(string photoPath, string caption)
+    {
+        try
+        {
+            string? token = _config["Telegram:BotToken"]?.Trim();
+            string? chatId = _config["Telegram:ChatId"]?.Trim();
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(chatId)) return;
+
+            if (!File.Exists(photoPath))
+            {
+                // Fall back to text-only if the file disappeared
+                await SendSimpleTelegramMessageAsync(caption + "\n\n⚠️ Capture file unavailable.");
+                return;
+            }
+
+            string url = $"https://api.telegram.org/bot{token}/sendPhoto";
+
+            // Truncate caption to Telegram's 1024-char limit for photo captions
+            if (caption.Length > 1024)
+                caption = caption[..1021] + "...";
+
+            using var form = new MultipartFormDataContent();
+            form.Add(new StringContent(chatId), "chat_id");
+            form.Add(new StringContent(caption), "caption");
+
+            byte[] photoBytes = await File.ReadAllBytesAsync(photoPath);
+            var photoContent = new ByteArrayContent(photoBytes);
+            photoContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("image/jpeg");
+            form.Add(photoContent, "photo", Path.GetFileName(photoPath));
+
+            await _httpClient.PostAsync(url, form);
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to send Telegram photo: {ex.Message}");
+            // Fall back to text-only
+            try { await SendSimpleTelegramMessageAsync(caption); } catch { }
         }
     }
 

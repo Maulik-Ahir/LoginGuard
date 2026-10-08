@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\UI\LoginGuardUI.csproj" />
+    <ProjectReference Include="..\..\Service\LoginGuardService.csproj" />
   </ItemGroup>
 
 </Project>
