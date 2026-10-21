@@ -102,6 +102,71 @@ public class PhysicalSecurityMonitoringTests : IDisposable
         Assert.Equal("F:", pass3[0].DriveLetter);
     }
 
+    [Fact]
+    public void UsbStorageDetector_PnpDevice_DetectsPhoneAndExtractsVidPid()
+    {
+        var detector = new UsbStorageDetector();
+
+        var phoneDevice = new UsbPnpDeviceSnapshot(
+            DeviceId: @"USB\VID_22D9&PID_2764\U4RSQKSWPNTSRWQC",
+            Name: "realme 6",
+            Description: "MTP Device",
+            Manufacturer: "realme",
+            PnpClass: "WPD",
+            HardwareId: "USB\\VID_22D9&PID_2764&REV_0404",
+            ClassifiedType: "phone",
+            DriveLetter: null,
+            VolumeLabel: null
+        );
+
+        var incidents = detector.EvaluatePnpDeviceChanges(new[] { phoneDevice }, "SEC-PC");
+
+        Assert.Single(incidents);
+        var inc = incidents[0];
+        Assert.Equal(SecurityEventType.USBStorageInserted, inc.EventType);
+        Assert.Equal("realme 6", inc.DeviceName);
+        Assert.Equal("phone", inc.DeviceClass);
+        Assert.Equal("realme", inc.Manufacturer);
+        Assert.Equal(@"USB\VID_22D9&PID_2764\U4RSQKSWPNTSRWQC", inc.DeviceId);
+        Assert.Contains("VID_22D9&PID_2764", inc.Details);
+        Assert.Equal(CaptureStatus.NotApplicable, inc.CaptureStatus);
+        Assert.Equal("SEC-PC", inc.Workstation);
+    }
+
+    [Fact]
+    public void UsbStorageDetector_ClassifyDeviceType_ClassifiesAllCategories()
+    {
+        Assert.Equal("phone", UsbStorageDetector.ClassifyDeviceType("WPD", null, "Galaxy S22", "MTP Device", null));
+        Assert.Equal("USB storage", UsbStorageDetector.ClassifyDeviceType("DiskDrive", "USBSTOR", "SanDisk Ultra", "Disk drive", "USBSTOR\\DISK"));
+        Assert.Equal("network adapter", UsbStorageDetector.ClassifyDeviceType("Net", null, "Realtek USB GbE", "Ethernet Adapter", null));
+        Assert.Equal("HID", UsbStorageDetector.ClassifyDeviceType("HIDClass", "HidUsb", "USB Optical Mouse", "HID Device", null));
+        Assert.Equal("IoT/serial device", UsbStorageDetector.ClassifyDeviceType("Ports", "usbser", "USB-SERIAL CH340 (COM3)", "Serial Port", null));
+        Assert.Equal("unknown", UsbStorageDetector.ClassifyDeviceType("Custom", null, "Custom Device", "Proprietary", null));
+    }
+
+    [Fact]
+    public void UsbStorageDetector_PnpDuplicateCheck_SuppressesDuplicateAlerts()
+    {
+        var detector = new UsbStorageDetector();
+        var phone = new UsbPnpDeviceSnapshot(
+            DeviceId: "USB\\VID_1234&PID_5678\\ABC",
+            Name: "Pixel 7",
+            Description: null,
+            Manufacturer: "Google",
+            PnpClass: "WPD",
+            HardwareId: null,
+            ClassifiedType: "phone",
+            DriveLetter: null,
+            VolumeLabel: null
+        );
+
+        var first = detector.EvaluatePnpDeviceChanges(new[] { phone });
+        Assert.Single(first);
+
+        var second = detector.EvaluatePnpDeviceChanges(new[] { phone });
+        Assert.Empty(second);
+    }
+
     [Theory]
     [InlineData(@"E:\", "E:")]
     [InlineData("e:", "E:")]

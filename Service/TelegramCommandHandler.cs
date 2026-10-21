@@ -99,12 +99,16 @@ public static class TelegramCommandHandler
             string message;
             if (latest.EventType == SecurityEventType.USBStorageInserted)
             {
+                var vidPid = UsbStorageDetector.ExtractVidPid(latest.HardwareId ?? latest.DeviceId);
                 message =
-                    "🔍 Latest Incident: USB Storage Inserted\n\n" +
+                    "🔍 Latest Incident: USB Device Connected\n\n" +
                     $"Time: {latest.DetectedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}\n" +
-                    $"Device: {latest.DeviceName ?? "USB Drive"}\n" +
-                    $"Drive: {latest.DriveLetter ?? "Unknown"}\n" +
-                    (string.IsNullOrEmpty(latest.VolumeLabel) ? "" : $"Volume: {latest.VolumeLabel}\n") +
+                    $"Device: {latest.DeviceName ?? "USB Device"}\n" +
+                    $"Type: {latest.DeviceClass ?? "device"}\n" +
+                    (!string.IsNullOrWhiteSpace(latest.Manufacturer) ? $"Manufacturer: {latest.Manufacturer}\n" : "") +
+                    (!string.IsNullOrWhiteSpace(latest.DriveLetter) ? $"Drive: {latest.DriveLetter}\n" : "") +
+                    (!string.IsNullOrWhiteSpace(vidPid) ? $"Hardware ID: {vidPid}\n" : "") +
+                    (!string.IsNullOrWhiteSpace(latest.VolumeLabel) ? $"Volume: {latest.VolumeLabel}\n" : "") +
                     $"Telegram: {notifStatusText}";
             }
             else if (latest.EventType is SecurityEventType.Shutdown or SecurityEventType.Restart or SecurityEventType.UnexpectedShutdown)
@@ -176,9 +180,10 @@ public static class TelegramCommandHandler
                 {
                     string dev = !string.IsNullOrWhiteSpace(inc.VolumeLabel)
                         ? inc.VolumeLabel
-                        : (!string.IsNullOrWhiteSpace(inc.DeviceName) ? inc.DeviceName : "USB Drive");
-                    string drive = inc.DriveLetter ?? "?";
-                    lines.Add($"{i + 1}. {time} — 🔌 USB: {dev} ({drive}) — Telegram {notifEmoji}");
+                        : (!string.IsNullOrWhiteSpace(inc.DeviceName) ? inc.DeviceName : "USB Device");
+                    string classInfo = !string.IsNullOrWhiteSpace(inc.DeviceClass) ? $" [{inc.DeviceClass}]" : "";
+                    string drive = !string.IsNullOrWhiteSpace(inc.DriveLetter) ? $" ({inc.DriveLetter})" : "";
+                    lines.Add($"{i + 1}. {time} — 🔌 USB: {dev}{classInfo}{drive} — Telegram {notifEmoji}");
                 }
                 else if (inc.EventType == SecurityEventType.Shutdown)
                 {
@@ -240,10 +245,11 @@ public static class TelegramCommandHandler
                 string time = ev.DetectedAt.ToLocalTime().ToString("HH:mm");
                 string dev = !string.IsNullOrWhiteSpace(ev.VolumeLabel)
                     ? ev.VolumeLabel
-                    : (!string.IsNullOrWhiteSpace(ev.DeviceName) ? ev.DeviceName : "USB Drive");
-                string drive = ev.DriveLetter ?? "?";
+                    : (!string.IsNullOrWhiteSpace(ev.DeviceName) ? ev.DeviceName : "USB Device");
+                string classInfo = !string.IsNullOrWhiteSpace(ev.DeviceClass) ? $" [{ev.DeviceClass}]" : "";
+                string drive = !string.IsNullOrWhiteSpace(ev.DriveLetter) ? $" — {ev.DriveLetter}" : "";
 
-                lines.Add($"{i + 1}. {time} — {dev} — {drive}");
+                lines.Add($"{i + 1}. {time} — {dev}{classInfo}{drive}");
             }
 
             return string.Join("\n", lines);
@@ -258,16 +264,35 @@ public static class TelegramCommandHandler
     {
         string device = !string.IsNullOrWhiteSpace(incident.VolumeLabel)
             ? incident.VolumeLabel
-            : (!string.IsNullOrWhiteSpace(incident.DeviceName) ? incident.DeviceName : "USB Drive");
+            : (!string.IsNullOrWhiteSpace(incident.DeviceName) ? incident.DeviceName : "USB Device");
 
-        string drive = incident.DriveLetter ?? "Unknown";
+        string type = !string.IsNullOrWhiteSpace(incident.DeviceClass) ? incident.DeviceClass : "device";
         string time = incident.DetectedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
 
-        return
-            "🔌 USB Storage Detected\n\n" +
-            $"Device: {device}\n" +
-            $"Drive: {drive}\n" +
-            $"Time: {time}";
+        string header = string.Equals(incident.DeviceClass, "USB storage", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrEmpty(incident.DriveLetter)
+            ? "🔌 USB Storage Detected\n"
+            : "🔌 USB Device Connected\n";
+
+        var lines = new List<string>
+        {
+            header,
+            $"Device: {device}",
+            $"Type: {type}"
+        };
+
+        if (!string.IsNullOrWhiteSpace(incident.Manufacturer))
+            lines.Add($"Manufacturer: {incident.Manufacturer}");
+
+        if (!string.IsNullOrWhiteSpace(incident.DriveLetter))
+            lines.Add($"Drive: {incident.DriveLetter}");
+
+        var vidPid = UsbStorageDetector.ExtractVidPid(incident.HardwareId ?? incident.DeviceId);
+        if (!string.IsNullOrWhiteSpace(vidPid))
+            lines.Add($"Hardware ID: {vidPid}");
+
+        lines.Add($"Time: {time}");
+
+        return string.Join("\n", lines);
     }
 
     // ── /pending ───────────────────────────────────────────

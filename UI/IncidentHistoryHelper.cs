@@ -49,9 +49,9 @@ public static class IncidentHistoryHelper
     public static string FormatEventDetails(Incident incident) => incident.EventType switch
     {
         SecurityEventType.USBStorageInserted =>
-            !string.IsNullOrWhiteSpace(incident.VolumeLabel)
-                ? $"{incident.VolumeLabel} ({incident.DriveLetter})"
-                : (!string.IsNullOrWhiteSpace(incident.DeviceName) ? incident.DeviceName : $"{incident.DriveLetter ?? "USB"}"),
+            !string.IsNullOrWhiteSpace(incident.DeviceName)
+                ? $"{incident.DeviceName} [{incident.DeviceClass ?? "USB"}]{(!string.IsNullOrWhiteSpace(incident.DriveLetter) ? $" ({incident.DriveLetter})" : "")}"
+                : (!string.IsNullOrWhiteSpace(incident.VolumeLabel) ? $"{incident.VolumeLabel} ({incident.DriveLetter})" : "USB Device"),
 
         SecurityEventType.Shutdown           => incident.Details ?? "Normal Shutdown",
         SecurityEventType.Restart            => incident.Details ?? "System Restart",

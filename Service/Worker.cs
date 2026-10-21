@@ -1110,7 +1110,7 @@ public class Worker : BackgroundService
 
     private async Task RunUsbMonitoringAsync(CancellationToken stoppingToken)
     {
-        Log("USB removable storage monitoring started.");
+        Log("USB device & removable storage monitoring started.");
         _usbDetector.InitializeFromCurrentDrives();
 
         while (!stoppingToken.IsCancellationRequested)
@@ -1120,7 +1120,8 @@ public class Worker : BackgroundService
                 var newIncidents = _usbDetector.DetectNewInsertions();
                 foreach (var incident in newIncidents)
                 {
-                    Log($"USB Storage Inserted: {incident.DeviceName} on {incident.DriveLetter} (Incident: {incident.IncidentId})");
+                    string targetInfo = !string.IsNullOrEmpty(incident.DriveLetter) ? $" on {incident.DriveLetter}" : "";
+                    Log($"USB Device Detected [{incident.DeviceClass}]: {incident.DeviceName}{targetInfo} (Incident: {incident.IncidentId})");
                     IncidentRepository.SaveIncident(_historyDir, incident);
 
                     // Send Telegram alert
@@ -1136,7 +1137,7 @@ public class Worker : BackgroundService
                                 incident.NotificationAttempts = 1;
                                 incident.LastNotificationAttempt = DateTime.UtcNow;
                                 IncidentRepository.SaveIncident(_historyDir, incident);
-                                Log($"USB Telegram alert sent successfully for {incident.DriveLetter}");
+                                Log($"USB Telegram alert sent successfully for {incident.DeviceName}");
                             }
                             else
                             {

@@ -44,6 +44,11 @@ public class Incident
     public DateTime? LastNotificationAttempt { get; set; }
     public string? LastNotificationError { get; set; }
     public string? DeviceName { get; set; }
+    public string? DeviceDescription { get; set; }
+    public string? Manufacturer { get; set; }
+    public string? DeviceClass { get; set; }
+    public string? HardwareId { get; set; }
+    public string? DeviceId { get; set; }
     public string? DriveLetter { get; set; }
     public string? VolumeLabel { get; set; }
     public string? Details { get; set; }

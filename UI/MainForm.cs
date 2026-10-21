@@ -431,8 +431,19 @@ public partial class MainForm : Form
 
         if (inc.EventType == SecurityEventType.USBStorageInserted)
         {
-            lines.Add($"Device / Volume:        {inc.DeviceName ?? "(unknown)"}");
-            lines.Add($"Drive Letter:           {inc.DriveLetter ?? "(unknown)"}");
+            lines.Add($"Device Name:            {inc.DeviceName ?? "Unknown USB Device"}");
+            if (!string.IsNullOrEmpty(inc.DeviceDescription))
+                lines.Add($"Description:            {inc.DeviceDescription}");
+            if (!string.IsNullOrEmpty(inc.DeviceClass))
+                lines.Add($"Device Class / Type:    {inc.DeviceClass}");
+            if (!string.IsNullOrEmpty(inc.Manufacturer))
+                lines.Add($"Manufacturer:           {inc.Manufacturer}");
+            if (!string.IsNullOrEmpty(inc.HardwareId))
+                lines.Add($"Hardware ID:            {inc.HardwareId}");
+            if (!string.IsNullOrEmpty(inc.DeviceId))
+                lines.Add($"Device ID (Instance):   {inc.DeviceId}");
+            if (!string.IsNullOrEmpty(inc.DriveLetter))
+                lines.Add($"Drive Letter:           {inc.DriveLetter}");
             if (!string.IsNullOrEmpty(inc.VolumeLabel))
                 lines.Add($"Volume Label:           {inc.VolumeLabel}");
             if (!string.IsNullOrEmpty(inc.Details))
